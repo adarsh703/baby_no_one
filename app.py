@@ -2120,7 +2120,9 @@ async def on_ready():
                             if parts:
                                 messages.append(" | ".join(parts))
                     if messages:
-                        server_channel_knowledge[channel.name] = "\n".join(messages)
+                        # Give the AI the exact numeric ID so it can ping the channel correctly
+                        ping_instruction = f"IMPORTANT: To mention or link this channel to a user, you MUST type exactly <#{channel.id}>\n\n"
+                        server_channel_knowledge[channel.name] = ping_instruction + "\n".join(messages)
                         logging.info(f"Read #{channel.name} ({len(messages)} entries)")
                 except Exception as e:
                     logging.warning(f"Skipped #{channel.name}: {e}")
@@ -2250,6 +2252,48 @@ async def on_message(m: discord.Message):
                     hype_msg = hype if hype else f"**{label} SOLVED!** 🎉"
                     
                 await m.channel.send(f"{hype_msg} {m.author.mention} wins **50 Aura**!\n> ✅ Answer: **{active_puzzle['answer'].title()}**")
+    # --- COMBINED REACTIONS (Keywords + AI) ---
+    if m.channel.id in (CHAT_CHANNEL_ID, CHAT_CHANNEL_ID_2) and not m.author.bot:
+        import random # Moved up here
+        import asyncio # Moved up here
+        
+        text_lower = m.content.lower()
+        reacted = False
+# 1. Keyword Reactions
+        if "baby no one" in text_lower:
+            import asyncio
+            await asyncio.sleep(1) # Wait 1 second so Discord doesn't glitch
+            await m.add_reaction("\N{EYES}") # Use official Unicode name
+            reacted = True
+            
+        elif "aura" in text_lower:
+            if random.random() < 0.40: 
+                import asyncio
+                await asyncio.sleep(1)
+                await m.add_reaction("\N{SPARKLES}")
+                reacted = True
+                
+        elif any(word in text_lower for word in ["sad", "crying", "lost all my aura"]):
+            import asyncio
+            await asyncio.sleep(1)
+            await m.add_reaction("\N{SKULL}")
+            reacted = True
+
+        # 2. AI Smart Reactions (Only if a keyword reaction didn't happen)
+        if not reacted:
+            if random.random() < 0.10:  
+                async def ai_react():
+                    try:
+                        prompt = f"Read this Discord message: '{m.content}'. Respond with EXACTLY ONE emoji that represents the best, funniest, or most sarcastic reaction to it. If it is just a boring message that doesn't need a reaction, reply with the exact word NONE. Do not include any other text."
+                        emoji = await quick_ai(prompt, max_tokens=10)
+                        if emoji:
+                            emoji = emoji.strip()
+                            if "NONE" not in emoji and len(emoji) <= 2:
+                                await m.add_reaction(emoji)
+                    except Exception:
+                        pass 
+                
+                asyncio.create_task(ai_react())
 
     # --- 2. NOW block the bot from doing anything else ---
     if m.author.bot: 
