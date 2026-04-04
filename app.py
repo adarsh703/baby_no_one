@@ -267,7 +267,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
             )
         )
         
-        reply = response.text.strip()
+        reply = response.text.strip() if response.text else ""
         if channel_id and reply:
             ai_conversation_history[channel_id].append({"role": "model", "content": reply})
         return reply
@@ -424,7 +424,7 @@ async def quick_ai(prompt: str, max_tokens: int = 200) -> str:
                 temperature=0.95
             )
         )
-        text = response.text.strip()
+        text = response.text.strip() if response.text else ""
         
         import re
         if text and text[-1] not in ".!?\"'*~":
