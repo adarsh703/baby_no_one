@@ -2217,6 +2217,41 @@ async def on_guild_channel_create(channel):
 
 @bot.event
 async def on_message(m: discord.Message):
+    
+    # --- 1. PUZZLE CHECK (Allows the bot to steal the answer) ---
+    if m.channel.id in (CHAT_CHANNEL_ID, CHAT_CHANNEL_ID_2):
+        if active_puzzle["question"] and not active_puzzle["solved"]:
+            import re
+            text_check = m.content.lower().strip()
+            correct_ans = active_puzzle["answer"].lower()
+            
+            # Checks if the exact answer is anywhere inside the sentence
+            if text_check == correct_ans or re.search(r'\b' + re.escape(correct_ans) + r'\b', text_check):
+                active_puzzle["solved"] = True
+                uid = m.author.id
+                balance[uid] += 50
+                
+                # Only track stats/milestones if it's a real human
+                if not m.author.bot:
+                    old_b = balance[uid] - 50
+                    weekly_aura_earned[uid] += 50
+                    asyncio.create_task(check_balance_milestone(uid, old_b, balance[uid]))
+                    
+                save_data()
+                
+                ptype = active_puzzle.get("type", "riddle")
+                type_labels = {"riddle": "🧩 Riddle", "scramble": "🔀 Word Scramble", "math": "🔢 Math", "trivia": "🎯 Trivia", "emoji": "🎭 Emoji", "fillblank": "✏️ Fill in the Blank"}
+                label = type_labels.get(ptype, "🧩 Puzzle")
+                
+                if m.author.bot:
+                    hype_msg = f"🤖 **{label} STOLEN BY THE BOT!** You guys are too slow."
+                else:
+                    hype = await quick_ai(f"Someone named {m.author.display_name} just solved a {ptype} puzzle in a Discord server and won 50 Aura! Write a short hype message congratulating them. Be fun, 1 sentence max.", max_tokens=160)
+                    hype_msg = hype if hype else f"**{label} SOLVED!** 🎉"
+                    
+                await m.channel.send(f"{hype_msg} {m.author.mention} wins **50 Aura**!\n> ✅ Answer: **{active_puzzle['answer'].title()}**")
+
+    # --- 2. NOW block the bot from doing anything else ---
     if m.author.bot: 
         return
 
@@ -2353,27 +2388,6 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
         except: 
             pass
         return await m.channel.send(f"{m.author.mention}, watch your language. {E_WARN}", delete_after=5)
-
-    if m.channel.id in (CHAT_CHANNEL_ID, CHAT_CHANNEL_ID_2):
-        uid = m.author.id
-        # Puzzle answer check
-        if active_puzzle["question"] and not active_puzzle["solved"]:
-            user_ans = text.strip().lower()
-            correct_ans = active_puzzle["answer"].lower()
-            # Allow minor spacing differences for multi-word answers
-            if user_ans == correct_ans or user_ans.replace(" ", "") == correct_ans.replace(" ", ""):
-                active_puzzle["solved"] = True
-                old_b = balance[uid]
-                balance[uid] += 50
-                weekly_aura_earned[uid] += 50
-                asyncio.create_task(check_balance_milestone(uid, old_b, balance[uid]))
-                save_data()
-                ptype = active_puzzle.get("type", "riddle")
-                type_labels = {"riddle": "🧩 Riddle", "scramble": "🔀 Word Scramble", "math": "🔢 Math", "trivia": "🎯 Trivia", "emoji": "🎭 Emoji", "fillblank": "✏️ Fill in the Blank"}
-                label = type_labels.get(ptype, "🧩 Puzzle")
-                hype = await quick_ai(f"Someone named {m.author.display_name} just solved a {ptype} puzzle in a Discord server and won 50 Aura! Write a short hype message congratulating them. Be fun, 1 sentence max.", max_tokens=160)
-                hype_msg = hype if hype else f"**{label} SOLVED!** 🎉"
-                await m.channel.send(f"{hype_msg} {m.author.mention} wins **50 Aura**!\n> ✅ Answer: **{active_puzzle['answer'].title()}**")
 
         found_hard = next((egg for egg in hard_eggs if egg in text), None)
         found_easy = next((egg for egg in easy_eggs if egg in text), None)
@@ -2839,7 +2853,8 @@ async def science_fact_dropper():
 async def daily_puzzle_scheduler():
     global puzzles_sent_today, puzzle_date, active_puzzle, last_puzzle_time
 
-    today = datetime.datetime.now(IST).date().isoformat()
+    now_ist = datetime.datetime.now(IST)
+    today = now_ist.date().isoformat()
 
     # Reset at midnight
     if puzzle_date != today:
@@ -2851,11 +2866,18 @@ async def daily_puzzle_scheduler():
     if puzzles_sent_today >= 2:
         return
 
-    # Enforce minimum 5 hour gap between puzzles
-    if puzzles_sent_today == 1 and (time.time() - last_puzzle_time) < 5 * 3600:
-        return
+    # --- NEW TIMING LOGIC ---
+    if puzzles_sent_today == 1:
+        # Hold the second puzzle until 2:00 PM (14:00) IST
+        # Change '14' to '16' for 4 PM, '18' for 6 PM, etc.
+        if now_ist.hour < 14:
+            return
+            
+        # Still keep a minimum 5-hour gap just in case the bot was offline at midnight
+        if (time.time() - last_puzzle_time) < 5 * 3600:
+            return
 
-    # 33% chance per tick so timing stays unpredictable
+    # 33% chance per tick so timing stays unpredictable within the allowed window
     if random.random() > 0.33:
         return
 
@@ -2882,7 +2904,7 @@ async def daily_puzzle_scheduler():
 
     ptype = puzzle.get("type", "riddle")
     type_config = {
-        "riddle":    ("🧩", "Riddle",           discord.Color.purple(),     "Think carefully and type your answer!"),
+        "riddle":    ("🧩", "Riddle",            discord.Color.purple(),     "Think carefully and type your answer!"),
         "scramble":  ("🔀", "Word Scramble",     discord.Color.orange(),     "Unscramble the letters to find the word!"),
         "math":      ("🔢", "Math Challenge",    discord.Color.blue(),       "Type just the number as your answer!"),
         "trivia":    ("🎯", "Trivia Question",   discord.Color.gold(),       "Type your answer in chat!"),
