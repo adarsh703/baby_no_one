@@ -2,3 +2,6 @@ discord.py
 python-dotenv
 aiohttp
 google-genai
+gspread
+oauth2client
+praw
