@@ -113,6 +113,5 @@ Pull requests are welcome! If you're adding new AI interactions or economy featu
 
 This project is licensed under the MIT License.
 
-```
 
 
