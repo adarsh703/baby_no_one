@@ -1,4 +1,3 @@
-```markdown
 # 🤖 baby_no_one - Advanced Discord Economy & AI Bot
 
 A highly advanced, feature-rich Discord bot combining a complex simulated economy, dynamic stock market, PvP casino games, and intelligent AI conversations powered by Google's Vertex AI (Gemini 2.5 Flash). 
@@ -116,4 +115,4 @@ This project is licensed under the MIT License.
 
 ```
 
-```
+
