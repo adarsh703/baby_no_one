@@ -4,7 +4,7 @@ from discord import app_commands
 import os
 import json
 import logging
-import asynci
+import asyncio
 import aiohttp
 import random
 import time
@@ -14,7 +14,9 @@ from collections import defaultdict, deque
 from typing import Optional
 from google import genai
 from google.genai import types
+# ================== ENV & LOGGING ==================
 load_dotenv()
+# Use your Project ID from the screenshot
 vertex_client = genai.Client(
     vertexai=True, 
     project="discord-bot-490910", 
@@ -30,6 +32,14 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 AI_SYSTEM = """You are baby_no_one, the bot of this Discord server. Smart, bully, chill, a bit witty. You feel like a real member, not a robot.
 
 RESPONSE RULES:
+- CRITICAL KNOWLEDGE - SERVER TASKS:
+- IF A USER ASKS ABOUT TASKS (e.g., "how to do tasks", "where are tasks"): You MUST tell them the exact workflow.
+- Step 1: Tell them to get verified by creating a ticket in the ticket channel.
+- Step 2: Tell them that once verified, tasks are posted in the task channels like [1450947408606269583] and [I1450948163002302464] and [1450947898324947099].
+- Step 3: Tell them to read the rules first. 
+- NEVER make up or hallucinate channel names. Only use the exact channels listed here.
+- CRITICAL FORMATTING: NEVER use LaTeX, math blocks, or symbols like \(, \), \[, \], or $. Write all numbers, percentages, and currencies in plain standard text (e.g., "100 Aura", "10 percent", "1 million"). If you use math formatting, the system will crash.
+- IF ASKED FOR A JOKE: NEVER use standard/classic internet dad jokes. Make up something completely unhinged, sarcastic, and original about the server's Aura economy, the stock market, or the users.
 - NEVER start your reply with "baby_no_one:" — just reply directly.
 - SHORT replies always. Max 1-2 sentences for most things. Only go longer if someone asks for a detailed explanation.
 - Don't over-explain. Get to the point fast.
@@ -122,6 +132,7 @@ async def _try_set_reminder(user_id: int, channel_id: int, message: str) -> str:
     import re as _re
     lower = message.lower()
     
+    # 1. Expanded trigger words
     reminder_keywords = ["remind", "reminder", "याद", "alarm", "ping", "bata", "notify", "wake", "alert", "tag",]
     if not any(k in lower for k in reminder_keywords):
         return None
@@ -130,9 +141,11 @@ async def _try_set_reminder(user_id: int, channel_id: int, message: str) -> str:
     fire_time = None
     minutes = 0
 
+    # 2. Extract time (Now safely handles "a min", "an hour", "one day")
     rel = _re.search(r'(?:in|after|baad)\s+(a|an|one|\d+)\s*(sec|second|seconds|min|minute|minutes|hour|hours|hr|hrs|day|days|ghante|ghanta)', lower)
     if rel:
         num_str = rel.group(1)
+        # Convert "a", "an", "one" into the number 1
         num = 1 if num_str in ['a', 'an', 'one'] else int(num_str)
         unit = rel.group(2)
         
@@ -149,6 +162,7 @@ async def _try_set_reminder(user_id: int, channel_id: int, message: str) -> str:
         if fire_time is None:
             fire_time = now_ts + (minutes * 60)
 
+    # 3. Extract absolute time ("at 5 pm")
     if not fire_time:
         now_dt = datetime.datetime.now(IST)
         tm = _re.search(r'at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', lower)
@@ -170,6 +184,7 @@ async def _try_set_reminder(user_id: int, channel_id: int, message: str) -> str:
     if not fire_time:
         return None
 
+    # 4. Clean the reminder text perfectly
     text = _re.sub(r'<@!?\d+>', '', message) # Strip bot ping
     text = _re.sub(r'\b(?:remind|reminder|ping|alarm|wake|notify)\s*(?:me\s*)?', '', text, flags=_re.IGNORECASE)
     text = _re.sub(r'((?:in|after|baad)\s+(?:a|an|one|\d+)\s*(?:min\w*|hour\w*|hr\w*|day\w*|sec\w*|ghante?)|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)', '', text, flags=_re.IGNORECASE)
@@ -229,11 +244,16 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
     history.append({"role": "user", "content": f"{username}: {user_message}"})
     if len(history) > 60: history = history[-60:]
 
-    user_bal = balance.get(user_id, 0)
-    user_streak = daily_streak.get(user_id, 0)
-    stock_prices = ", ".join(f"{c}: {v:.1f}" for c, v in stocks.items())
+    # Only feed the AI stock and balance info if the user brings it up
+    eco_keywords = ["aura", "stock", "market", "price", "portfolio", "balance", "coin", "rich", "poor", "money", "buy", "sell", "invest"]
+    needs_economy = any(kw in user_message.lower() for kw in eco_keywords)
     
-    user_context = f"\n\n[User info for {username}]\nAura balance: {user_bal:,}\nDaily streak: {user_streak} days\nCurrent stock prices: {stock_prices}"
+    user_context = f"\n\n[User info for {username}]"
+    if needs_economy:
+        user_bal = balance.get(user_id, 0)
+        user_streak = daily_streak.get(user_id, 0)
+        stock_prices = ", ".join(f"{c}: {v:.1f}" for c, v in stocks.items())
+        user_context += f"\nAura balance: {user_bal:,}\nDaily streak: {user_streak} days\nCurrent stock prices: {stock_prices}"
 
     channel_knowledge_str = ""
     if server_channel_knowledge:
@@ -246,6 +266,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
 
     system_with_context = AI_SYSTEM + (f"\n\n{server_custom_emojis}" if server_custom_emojis else "") + user_context + mem_str + channel_knowledge_str + context_str
 
+    # --- NEW IMAGE LOGIC HERE ---
     request_contents = [f"{username}: {user_message}"]
 
     if avatar_url:
@@ -255,13 +276,14 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
                     if resp.status == 200:
                         img_data = await resp.read()
                         mime_type = resp.headers.get("Content-Type", "image/png").split(";")[0]
+                        # Add the image bytes to the request
                         request_contents.insert(0, types.Part.from_bytes(data=img_data, mime_type=mime_type))
         except Exception as e:
             logging.error(f"Failed to fetch avatar: {e}")
 
     try:
         response = await vertex_client.aio.models.generate_content(
-            model="gemini-2.5-flash", # Or gemini-2.5-flash
+            model="gemini-2.5-flash", 
             contents=request_contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_with_context,
@@ -270,7 +292,11 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
             )
         )
         
-        reply = response.text.strip()
+        # Safely extract and aggressively strip Discord-breaking math markdown
+        reply = response.text if response.text else ""
+        reply = reply.replace(r"\(", "").replace(r"\)", "").replace(r"\[", "").replace(r"\]", "")
+        reply = reply.replace("$", "\\$").strip()
+        
         if channel_id and reply:
             ai_conversation_history[channel_id].append({"role": "model", "content": reply})
         return reply
@@ -279,12 +305,14 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
         logging.error(f"Vertex AI Error: {e}")
         return None
 
+    # Build channel context string from recent messages
     context_str = ""
     if channel_id and channel_id in channel_chat_log:
         recent = list(channel_chat_log[channel_id])[-10:]
         if recent:
             context_str = "\n\nRecent messages in this channel (background context only — focus on what the user just asked you):\n" + "\n".join(recent)
 
+    # Use channel-wide conversation history (group chat style)
     if channel_id not in ai_conversation_history:
         ai_conversation_history[channel_id] = []
 
@@ -295,6 +323,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
         history = history[-60:]
         ai_conversation_history[channel_id] = history
 
+    # Inject user-specific live data
     user_bal = balance.get(user_id, 0)
     user_streak = daily_streak.get(user_id, 0)
     user_portfolio = portfolios.get(user_id, {})
@@ -307,6 +336,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
         if holdings:
             portfolio_str = f"\nTheir portfolio: {', '.join(holdings)}"
 
+    # Member profile info
     member_info = ""
     if member:
         roles = [r.name for r in member.roles if r.name != "@everyone"]
@@ -325,6 +355,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
     now_ist = datetime.datetime.now(IST)
     current_time = now_ist.strftime("%I:%M %p IST, %A %d %B %Y")
 
+    # Build server-wide member context — only when needed
     member_keywords = ["who", "their", "his", "her", "staff", "role", "balance of", "streak of", "richest", "leaderboard", "member", "joined", "kiska", "unka", "kaun", "kitna"]
     needs_member_list = any(kw in user_message.lower() for kw in member_keywords)
     guild = None
@@ -355,6 +386,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
         f"\nCurrent stock prices: {stock_prices}"
         f"{server_members_info}"
     )
+    # Add server channel knowledge (rules, info etc)
     channel_knowledge_str = ""
     if server_channel_knowledge:
         sections = []
@@ -362,6 +394,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
             sections.append(f"[#{ch_name}]\n{content}")
         channel_knowledge_str = "\n\n[Server Channel Content — use this to answer questions about rules, info, tasks etc]\n" + "\n\n".join(sections)
 
+    # Add persistent memory for this user
     mem_str = ""
     if user_id in user_persistent_memory and user_persistent_memory[user_id]:
         mem_str = "\n\n[What I remember about " + username + "]\n" + "\n".join(f"- {f}" for f in user_persistent_memory[user_id][-20:])
@@ -374,6 +407,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
             for msg in ([{"role": "system", "content": system_with_context}] + history):
                 role = "user" if msg["role"] in ("user", "system") else "model"
                 gemini_messages.append({"role": role, "parts": [{"text": msg["content"]}]})
+            # Add avatar image to last user message if available
             if avatar_url and gemini_messages:
                 try:
                     async with aiohttp.ClientSession() as _img_sess:
@@ -383,6 +417,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
                                 img_data = await _img_resp.read()
                                 img_b64 = _b64.b64encode(img_data).decode()
                                 content_type = _img_resp.headers.get("Content-Type", "image/png").split(";")[0]
+                                # Add image to last user message
                                 gemini_messages[-1]["parts"].append({
                                     "inline_data": {"mime_type": content_type, "data": img_b64}
                                 })
@@ -395,6 +430,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
                     if "candidates" in data:
                         candidate = data["candidates"][0]
                         parts = candidate.get("content", {}).get("parts", [])
+                        # Find the text part (skip tool use blocks)
                         text_parts = [p["text"] for p in parts if "text" in p]
                         if text_parts:
                             reply = " ".join(text_parts).strip()
@@ -417,9 +453,13 @@ async def quick_ai(prompt: str, max_tokens: int = 200) -> str:
                 temperature=0.95
             )
         )
-        text = response.text.strip()
         
+        # Safely extract text and aggressively strip Discord-breaking math markdown
+        text = response.text if response.text else ""
+        text = text.replace(r"\(", "").replace(r"\)", "").replace(r"\[", "").replace(r"\]", "")
+        text = text.replace("$", "\\$").strip()
         return text
+        
     except Exception as e:
         logging.error(f"Vertex quick_ai error: {e}")
         return ""
@@ -431,6 +471,7 @@ if not TOKEN:
 
 logging.basicConfig(level=logging.INFO)
 
+# ================== CONFIGURATION ==================
 CHAT_CHANNEL_ID = 1448727099727941836
 CHAT_CHANNEL_ID_2 = 1478785863126089759
 PAYOUT_CHANNEL_ID = 1449908271937753129
@@ -440,6 +481,7 @@ AUTOKICK_WARN_CHANNEL_ID = 1453059081127592130
 HELP_CHANNEL_ID = 1448787031810642010
 CONFESSION_CHANNEL_ID = 1475013891258974349 
 
+# --- BIRTHDAY CONFIG ---
 BIRTHDAY_CHANNEL_ID = 1473553195723784397
 BIRTHDAY_ROLE_ID = 1473554747633045615
 BIRTHDAY_GIFT_AMOUNT = 700
@@ -460,6 +502,7 @@ E_ROAST = "🔥"
 
 GIVEAWAY_BANNER_URL = "https://cdn.discordapp.com/attachments/1451675344305131592/1456295677603876949/20260101_200831.png"
 
+# ================== FULL RESPONSES & ROASTS ==================
 YO_RESPONSES = [
     "Yoo! Ready to stack some Aura today? 💰",
     "The legend has logged in. Wsg!",
@@ -584,6 +627,7 @@ def _save_bag(key, bag):
 yo_bag = SmartRandomizer(YO_RESPONSES, save_key="yo_bag")
 roast_bag = SmartRandomizer(ROASTS, save_key="roast_bag")
 
+# ================== DATA MANAGEMENT ==================
 DATA_FILE = "data.json"
 DEFAULT_STOCKS = {
     "$No_ONe": 100.0,
@@ -630,10 +674,13 @@ def load_data():
         "puzzle_date": "",
         "daily_sell_earnings": {},
         "sell_earnings_date": "",
-        "personality_season": 0
+        "personality_season": 0,
+        "vc_total_minutes": {},
+        "vc_milestones_reached": {}
     }
 
 data = load_data()
+# Bags loaded after SmartRandomizer class is defined below
 
 message_count = defaultdict(int, {int(k): v for k, v in data.get("messages", {}).items()})
 balance = defaultdict(int, {int(k): v for k, v in data.get("balance", {}).items()})
@@ -719,6 +766,8 @@ def save_data():
                 "daily_sell_earnings": dict(daily_sell_earnings),
                 "sell_earnings_date": sell_earnings_date,
                 "personality_season": personality_season,
+                "vc_total_minutes": dict(vc_total_minutes),
+                "vc_milestones_reached": vc_milestones_reached,
                 "yo_bag": yo_bag.bag,
                 "roast_bag": roast_bag.bag,
                 "delisted_coins": delisted_coins,
@@ -735,7 +784,8 @@ def save_data():
     except Exception as e:
         logging.error(f"Error saving data: {e}")
 
-TICKET_CATEGORY_IDS = {1448805784652746894, 1448806932575162422, 1451571863825154058, 1451800068641521846, 1457368711630426153, 1471222806200062196}
+# ================== HELPERS & CHARTING ==================
+TICKET_CATEGORY_IDS = {1448805784652746894, 1448806932575162422, 1451571863825154058, 1451800068641521846, 1457368711630426153, 1471222806200062196, 1495820309750616195}
 STAFF_ROLE_IDS = {1448719741756768308, 1449035039072452800, 1449035563570303017}
 AUTO_ROLE_IDS = {1448774516904825026}
 REMOVE_ROLE_IDS = {1448831320636784660, 1448774246447845518}
@@ -847,12 +897,14 @@ def generate_line_chart(history, width=CHART_W, height=CHART_H):
     return "\n".join(lines)
 
 def generate_area_chart(history, height=CHART_H):
+    # Single-char columns so chart stays compact and clean
     N = 12
     pts = _sample(history, N)
     if not pts:
         return "No data yet."
     mn, mx = min(pts), max(pts)
     spread = max(mx - mn, 1e-6)
+    # top-of-bar chars for partial rows
     tops = " ▁▂▃▄▅▆▇█"
     lines = []
     for r in range(height - 1, -1, -1):
@@ -860,8 +912,10 @@ def generate_area_chart(history, height=CHART_H):
         for v in pts:
             y = (v - mn) / spread * height  # 0..height float
             if y >= r + 1:
+                # fully filled row
                 row += "█"
             elif y > r:
+                # partial top
                 frac = y - r  # 0..1
                 row += tops[max(1, min(8, int(frac * 8)))]
             else:
@@ -911,6 +965,8 @@ def generate_candlestick_chart(history, height=CHART_H):
     return "\n".join(lines)
 
 
+# ================== CONFESSION SYSTEM ==================
+# Maps confession message_id -> author user_id (in memory only, never saved)
 confession_authors = {}
 
 class ConfessionReplyModal(discord.ui.Modal, title="Reply to Confession"):
@@ -925,6 +981,7 @@ class ConfessionReplyModal(discord.ui.Modal, title="Reply to Confession"):
         await interaction.response.defer(ephemeral=True)
         msg = interaction.message
 
+        # Determine if replier is the original confessor
         original_msg_id = str(msg.id)
         is_op = confession_authors.get(original_msg_id) == interaction.user.id
         author_label = "🕵️ OP (Original Confessor)" if is_op else "Anonymous Reply"
@@ -941,6 +998,7 @@ class ConfessionReplyModal(discord.ui.Modal, title="Reply to Confession"):
         embed.set_author(name=author_label, icon_url=author_icon)
 
         reply_msg = await thread.send(embed=embed, view=ThreadReplyView(original_msg_id))
+        # Track this reply's author too so OP badge works on thread replies
         confession_authors[str(reply_msg.id)] = interaction.user.id
 
         await interaction.followup.send("✅ Your reply was posted!" + (" (shown as OP)" if is_op else " (anonymous)"), ephemeral=True)
@@ -984,6 +1042,7 @@ class ThreadReplyView(discord.ui.View):
         self.add_item(btn)
 
     async def reply_btn(self, interaction: discord.Interaction):
+        # Try to find the original_msg_id from the custom_id if not set
         await interaction.response.send_modal(ThreadReplyModal(self.original_msg_id))
 
 
@@ -1020,6 +1079,7 @@ class ConfessionView(discord.ui.View):
     async def submit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ConfessionSubmitModal())
 
+# ================== BIRTHDAY SYSTEM (PANEL & MODAL) ==================
 class BirthdayModal(discord.ui.Modal, title="🎂 Set Your Birthday"):
     day = discord.ui.TextInput(label="Day (e.g. 18)", placeholder="18", min_length=1, max_length=2)
     month = discord.ui.TextInput(label="Month (e.g. 02)", placeholder="02", min_length=1, max_length=2)
@@ -1052,6 +1112,7 @@ class BirthdayPanelView(discord.ui.View):
             
         await interaction.response.send_modal(BirthdayModal())
 
+# ================== CASINO & GAMES ==================
 class BlackjackView(discord.ui.View):
     def __init__(self, player: discord.Member, bet: int):
         super().__init__(timeout=120)
@@ -1471,6 +1532,7 @@ class RouletteView(discord.ui.View):
             return await i.response.send_message("It's not your turn!", ephemeral=True)
 
         if random.randint(1, 6) == 1:
+            # This player dies, other wins
             winner = self.p2 if self.current_turn == self.p1 else self.p1
             self.btn.disabled = True
             balance[winner.id] += self.amt * 2
@@ -1478,6 +1540,7 @@ class RouletteView(discord.ui.View):
             e = discord.Embed(title="💥 BANG!", description=f"{self.current_turn.mention} pulled the trigger and it fired!\n\n🏆 {winner.mention} wins **{self.amt*2:,} Aura**!", color=discord.Color.red())
             return await i.response.edit_message(embed=e, view=self)
 
+        # Survived — switch turn
         self.current_turn = self.p2 if self.current_turn == self.p1 else self.p1
         self.btn.disabled = False
         e = discord.Embed(title="🔫 Russian Roulette", description=f"*Click.* They survived!\n\n{self.current_turn.mention}, it's your turn. Pull the trigger.", color=discord.Color.orange())
@@ -1580,6 +1643,7 @@ class AcceptDuelView(discord.ui.View):
             
         await i.response.edit_message(content=f"Duel cancelled by {i.user.mention}.", embed=None, view=self)
 
+# ================== PAYOUT, POLLS, & GIVEAWAYS ==================
 
 class PayoutView(discord.ui.View):
     def __init__(self, uid: int, amt: int, method: str, details: str, msg_id: str = "0"):
@@ -1595,6 +1659,7 @@ class PayoutView(discord.ui.View):
         if not is_staff(interaction.user): 
             return await interaction.response.send_message("Staff only.", ephemeral=True)
 
+        # Load fresh data from pending_payouts in case of restart
         msg_id = str(interaction.message.id)
         pdata = pending_payouts.get(msg_id, {})
         uid = pdata.get("uid", self.uid)
@@ -1618,6 +1683,7 @@ class PayoutView(discord.ui.View):
             item_public = f"${(amt/AURA_TO_USD):.2f}" if method != "reddit" else "Reddit Account"
             await public_channel.send(embed=simple_embed(f"{E_SUCCESS} Withdrawal Successful!", f"<@{uid}> just withdrew **{item_public}** ({amt:,} Aura)!\nKeep chatting to earn more. {E_VIBE}", discord.Color.green()))
 
+        # Remove from pending
         pending_payouts.pop(msg_id, None)
         save_data()
 
@@ -1631,6 +1697,7 @@ class PayoutView(discord.ui.View):
         if not is_staff(interaction.user): 
             return await interaction.response.send_message("Staff only.", ephemeral=True)
 
+        # Load fresh data from pending_payouts in case of restart
         msg_id = str(interaction.message.id)
         pdata = pending_payouts.get(msg_id, {})
         uid = pdata.get("uid", self.uid)
@@ -1652,6 +1719,7 @@ class PayoutView(discord.ui.View):
         if public_channel:
             await public_channel.send(embed=simple_embed(f"❌ Withdrawal Rejected", f"<@{uid}>'s withdrawal for **{amt:,} Aura** was rejected and refunded.", discord.Color.red()))
 
+        # Remove from pending
         pending_payouts.pop(msg_id, None)
         save_data()
 
@@ -1790,6 +1858,7 @@ class GiveawayView(discord.ui.View):
         if not p:
             return await i.response.send_message("No entries yet!", ephemeral=True)
 
+        # Build full list, split into chunks of 40 mentions per embed to stay under Discord's 4096 char limit
         mentions = [f"<@{uid}>" for uid in p]
         chunk_size = 40
         chunks = [mentions[x:x+chunk_size] for x in range(0, len(mentions), chunk_size)]
@@ -1799,9 +1868,11 @@ class GiveawayView(discord.ui.View):
             title = f"👥 All Entries ({len(p)} total)" if idx == 0 else f"👥 Entries (cont. {idx+1})"
             embeds.append(discord.Embed(title=title, description="\n".join(chunk), color=discord.Color.blue()))
 
+        # Discord allows max 10 embeds per message
         await i.response.send_message(embeds=embeds[:10], ephemeral=True)
 
 
+# ================== BOT EVENT SYSTEM ==================
 class MyBot(commands.Bot):
     def __init__(self): 
         super().__init__(command_prefix="!", intents=discord.Intents.all(), help_command=None)
@@ -1817,6 +1888,7 @@ class MyBot(commands.Bot):
         self.add_view(BirthdayPanelView())
         self.add_view(ConfessionView())
         
+        # Restore pending payouts
         for mid, pdata in pending_payouts.items():
             self.add_view(PayoutView(pdata["uid"], pdata["amt"], pdata["method"], pdata["details"], mid))
             
@@ -1824,7 +1896,9 @@ class MyBot(commands.Bot):
         
         await self.tree.sync()
 
+        # START ALL BACKGROUND TASKS
         midnight_birthday_check.start()
+        vc_reward_task.start()
         check_birthday_roles.start()
         autokick_check.start()
         market_fluctuation.start()      
@@ -1839,7 +1913,10 @@ class MyBot(commands.Bot):
 bot = MyBot()
 last_chatter_id = None
 last_user_message = {}
+# ================== PUZZLE SYSTEM ==================
+# Types: riddle | scramble | math | trivia | emoji | fillblank
 PUZZLES = [
+    # ── RIDDLES ──
     {"type": "riddle", "q": "I speak without a mouth and hear without ears. I have no body, but I come alive with the wind. What am I?", "a": "echo"},
     {"type": "riddle", "q": "The more you take, the more you leave behind. What am I?", "a": "footsteps"},
     {"type": "riddle", "q": "I have cities but no houses, mountains but no trees, water but no fish. What am I?", "a": "map"},
@@ -1876,6 +1953,7 @@ PUZZLES = [
     {"type": "riddle", "q": "I am always hungry and must always be fed. The finger I touch will soon turn red. What am I?", "a": "fire"},
     {"type": "riddle", "q": "What has a bottom at the top?", "a": "legs"},
 
+    # ── WORD SCRAMBLES ──
     {"type": "scramble", "q": "OSDIC", "a": "disco"},
     {"type": "scramble", "q": "AKNB", "a": "bank"},
     {"type": "scramble", "q": "ROFEST", "a": "forest"},
@@ -1907,6 +1985,7 @@ PUZZLES = [
     {"type": "scramble", "q": "SHBRU", "a": "brush"},
     {"type": "scramble", "q": "AOCEN", "a": "ocean"},
 
+    # ── MATH ──
     {"type": "math", "q": "What is 17 × 6?", "a": "102"},
     {"type": "math", "q": "What is 144 ÷ 12?", "a": "12"},
     {"type": "math", "q": "What is 25² (25 squared)?", "a": "625"},
@@ -1928,6 +2007,7 @@ PUZZLES = [
     {"type": "math", "q": "If a pizza has 8 slices and you eat 3, what percentage did you eat? (round to nearest whole)", "a": "38"},
     {"type": "math", "q": "What is 500 × 0.25?", "a": "125"},
 
+    # ── TRIVIA ──
     {"type": "emoji", "q": "🦇🧛 = ? (movie)", "a": "batman"},
     {"type": "emoji", "q": "🧊🍦 = ?", "a": "ice cream"},
     {"type": "emoji", "q": "🏠🕷️ = ? (movie)", "a": "home alone"},
@@ -1954,6 +2034,7 @@ PUZZLES = [
     {"type": "emoji", "q": "📸👻 = ? (app)", "a": "snapchat"},
     {"type": "emoji", "q": "🎵🔗 = ? (app)", "a": "soundcloud"},
 
+    # ── EMOJI PUZZLES ──
     {"type": "emoji", "q": "🌊🏄 = ?", "a": "surfing"},
     {"type": "emoji", "q": "🍎📱 = ? (brand)", "a": "apple"},
     {"type": "emoji", "q": "🦁👑 = ? (movie)", "a": "lion king"},
@@ -1975,6 +2056,7 @@ PUZZLES = [
     {"type": "emoji", "q": "🎭😂 = ?", "a": "comedy"},
     {"type": "emoji", "q": "💀🏴‍☠️⚓ = ?", "a": "pirate"},
 
+    # ── FILL IN THE BLANK ──
     {"type": "fillblank", "q": "The early bird catches the ___.", "a": "worm"},
     {"type": "fillblank", "q": "Actions speak louder than ___.", "a": "words"},
     {"type": "fillblank", "q": "Every cloud has a silver ___.", "a": "lining"},
@@ -2016,16 +2098,19 @@ insider_uses_date = ""
 daily_sell_earnings = defaultdict(int, {int(k): v for k, v in data.get("daily_sell_earnings", {}).items()})
 sell_earnings_date = data.get("sell_earnings_date", "")
 personality_season = data.get("personality_season", 0)
-
+vc_total_minutes = defaultdict(int, {int(k): v for k, v in data.get("vc_total_minutes", {}).items()})
+vc_milestones_reached = data.get("vc_milestones_reached", {})
 
 
 @bot.event
 async def on_ready():
     logging.info(f"Bot online: {bot.user}")
     await bot.change_presence(activity=discord.Game(name="/help | Collecting Aura"))
+    # Restore randomizer bags from disk so no repeats across restarts
     yo_bag.load(data.get("yo_bag", []))
     roast_bag.load(data.get("roast_bag", []))
 
+    # Retroactively trim any portfolios over MAX_SHARES_PER_COIN and refund the excess invested Aura
     trimmed = 0
     for uid in portfolios:
         for coin in portfolios[uid]:
@@ -2043,15 +2128,18 @@ async def on_ready():
         save_data()
         logging.info(f"Trimmed {trimmed} portfolio entries to MAX_SHARES_PER_COIN={MAX_SHARES_PER_COIN} on startup, refunds issued")
 
+    # Cache current invites for all guilds
     for guild in bot.guilds:
         try:
             cached_invites[guild.id] = {inv.code: inv.uses for inv in await guild.invites()}
         except Exception:
             pass
 
+    # Read channel content from key categories so AI knows server info
     READ_CATEGORIES = {"important", "start here", "lounge", "reddit tasks", "extras"}
     global server_channel_knowledge, server_custom_emojis
     server_channel_knowledge = {}
+    # Fetch server custom emojis
     for guild in bot.guilds:
         emoji_list = [f"<{'a' if e.animated else ''}:{e.name}:{e.id}>" for e in guild.emojis]
         if emoji_list:
@@ -2142,7 +2230,9 @@ async def on_guild_channel_create(channel):
         return
     if not channel.category or channel.category.id != PAYMENT_TICKET_CATEGORY_ID:
         return
+    # Wait briefly for Discord to set up permissions
     await asyncio.sleep(1)
+    # Find who opened the ticket (first non-bot member with read access)
     opener = None
     for target, overwrite in channel.overwrites.items():
         if isinstance(target, discord.Member) and not target.bot:
@@ -2162,6 +2252,7 @@ async def on_message(m: discord.Message):
     if m.author.bot: 
         return
 
+    # ── Owner aura request handlers — must be FIRST before any other logic ──
     OWNER_ID = 992008865656868946
     text_raw = m.content.strip()
 
@@ -2188,7 +2279,9 @@ async def on_message(m: discord.Message):
             return
 
 
+    # ────────────────────────────────────────────────────────────────────────
         
+    # Log message to channel context — skip staff channels
     if not m.author.bot and m.content and not m.content.startswith('/'):
         if not (hasattr(m.channel, 'category') and m.channel.category and m.channel.category.name == "Staff Area"):
             if m.channel.id not in channel_chat_log:
@@ -2211,15 +2304,18 @@ async def on_message(m: discord.Message):
         yo_reply = await quick_ai(f"{m.author.display_name} just said '{m.content}' in the server chat. Give a short, fun greeting back. Match their language. Max 1 sentence.", max_tokens=160)
         await m.channel.send(yo_reply if yo_reply else yo_bag.get_next())
 
+    # Gemini AI — respond when bot is @mentioned
     if bot.user in m.mentions:
         question = m.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
 
+        # Ignore if message is just emojis or empty
         import re
         text_only = re.sub(r'<a?:[\w]+:[\d]+>', '', question).strip()
         text_only = re.sub('[\U0001F000-\U0001FFFF\U00002000-\U00003300]', '', text_only).strip()
         if not text_only:
             return
 
+        # Ignore all replies to bot messages that are slash command responses (have embeds, no plain content)
         if m.reference:
             try:
                 ref_msg = m.reference.cached_message or await m.channel.fetch_message(m.reference.message_id)
@@ -2231,6 +2327,7 @@ async def on_message(m: discord.Message):
         if not question:
             question = "kuch toh bol"
 
+        # Use AI to detect if this is genuinely a request FOR Aura (not just mentioning aura in conversation)
         OWNER_ID = 992008865656868946
         intent_prompt = f"""The user said: "{question}"
 Is the user directly asking YOU (the bot) to give them Aura/money/currency as a request? 
@@ -2261,17 +2358,21 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
             pending_aura_requests[ask_msg.id] = {"requester": m.author, "channel_id": m.channel.id}
             return
 
+        # Check if this is a reminder request
         reminder_set = await _try_set_reminder(m.author.id, m.channel.id, question)
         if reminder_set:
             await m.reply(reminder_set)
             return
 
         async with m.channel.typing():
+            # Only send avatar if this is the first time we've seen this user (no history yet)
             avatar = str(m.author.display_avatar.url) if m.author.display_avatar else None
             reply = await ask_ai(question, m.author.display_name, m.author.id, m.channel.id, member=m.author, avatar_url=avatar)
         if reply:
             import re as _re
+            # Strip any :shortcode: emoji patterns and malformed custom emoji syntax
             reply = _re.sub(r'(?<![<a]):[a-zA-Z0-9_]+:', '', reply)
+            # Fix or strip malformed custom emojis (wrong case like <A: instead of <a:)
             reply = _re.sub(r'<[A-Z]:[a-zA-Z0-9_]+:\d+>', '', reply)
             reply = reply.strip()
             if reply:
@@ -2287,9 +2388,11 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
 
     if m.channel.id in (CHAT_CHANNEL_ID, CHAT_CHANNEL_ID_2):
         uid = m.author.id
+        # Puzzle answer check
         if active_puzzle["question"] and not active_puzzle["solved"]:
             user_ans = text.strip().lower()
             correct_ans = active_puzzle["answer"].lower()
+            # Allow minor spacing differences for multi-word answers
             if user_ans == correct_ans or user_ans.replace(" ", "") == correct_ans.replace(" ", ""):
                 active_puzzle["solved"] = True
                 old_b = balance[uid]
@@ -2340,11 +2443,56 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
     await bot.process_commands(m)
 
 
+# ================== BACKGROUND TASKS ==================
+VC_MILESTONES = [10, 50, 100, 250, 500, 1000]
 
+@tasks.loop(minutes=1)
+async def vc_reward_task():
+    for guild in bot.guilds:
+        for vc in guild.voice_channels:
+            if guild.afk_channel and vc.id == guild.afk_channel.id:
+                continue
+                
+            for member in vc.members:
+                if member.bot or (member.voice and member.voice.self_deaf):
+                    continue
+
+                uid = member.id
+                vc_total_minutes[uid] += 1
+                mins = vc_total_minutes[uid]
+
+                # 13-Minute Continuous Reward
+                if mins % 13 == 0:
+                    balance[uid] += 2
+                    
+                # Milestone Rewards
+                if mins % 60 == 0:
+                    hours = mins // 60
+                    if hours in VC_MILESTONES:
+                        uid_str = str(uid)
+                        if uid_str not in vc_milestones_reached:
+                            vc_milestones_reached[uid_str] = []
+                            
+                        if hours not in vc_milestones_reached[uid_str]:
+                            vc_milestones_reached[uid_str].append(hours)
+                            balance[uid] += 100
+                            
+                            ch = bot.get_channel(CHAT_CHANNEL_ID)
+                            if ch:
+                                await ch.send(
+                                    embed=discord.Embed(
+                                        title="🎙️ Voice Milestone Hit!",
+                                        description=f"{member.mention} has spent **{hours} Hours** in voice channels!\nThey were just awarded a bonus of **100 Aura**! 🎉",
+                                        color=discord.Color.gold()
+                                    )
+                                )
+    save_data()
+    
 @tasks.loop(hours=1)
 async def server_mood_tracker():
     global last_mood_check
     now = datetime.datetime.now(IST)
+    # Only check once per day, randomly between 6pm-9pm IST
     if not (18 <= now.hour < 21):
         return
     today = now.date().isoformat()
@@ -2356,6 +2504,7 @@ async def server_mood_tracker():
     ch = bot.get_channel(CHAT_CHANNEL_ID)
     if not ch:
         return
+    # Collect recent messages from all non-staff channels
     all_msgs = []
     for cid, log in channel_chat_log.items():
         c = bot.get_channel(cid)
@@ -2374,21 +2523,25 @@ async def server_mood_tracker():
 @tasks.loop(hours=1)
 async def weekly_recap():
     now = datetime.datetime.now(IST)
+    # Only run on Sunday at 9pm IST
     if now.weekday() != 6 or now.hour != 21:
         return
     ch = bot.get_channel(CHAT_CHANNEL_ID)
     if not ch:
         return
 
+    # Top earner
     top_uid = max(balance, key=lambda u: balance[u]) if balance else None
     top_name = "unknown"
     if top_uid:
         m = ch.guild.get_member(top_uid) if ch.guild else None
         top_name = m.display_name if m else f"<@{top_uid}>"
 
+    # Biggest stock mover
     best_coin = max(stocks, key=lambda c: stocks[c]) if stocks else "unknown"
     worst_coin = min(stocks, key=lambda c: stocks[c]) if stocks else "unknown"
 
+    # Top casino loser
     top_loser_uid = max(casino_losses, key=lambda u: casino_losses[u]) if casino_losses else None
     loser_name = "nobody"
     if top_loser_uid:
@@ -2415,6 +2568,7 @@ async def weekly_recap():
         )
         embed.set_footer(text="See you next week! Keep earning 💪")
         await ch.send(embed=embed)
+    # Reset weekly casino tracking
     casino_losses.clear()
     casino_wins.clear()
     save_data()
@@ -2429,10 +2583,12 @@ async def market_fluctuation():
     today_str = now_ist.date().isoformat()
     current_hour = now_ist.hour
 
+    # Reset midday flip tracking at midnight
     if midday_flip_date != today_str:
         midday_flip_date = today_str
         midday_flip_done = False
 
+    # Mid-day personality flip: between 12pm-4pm IST, silent, once per day
     if not midday_flip_done and 12 <= current_hour < 16:
         if random.random() < 0.15:  # ~15% chance per tick in this window
             personality_season += 1
@@ -2441,8 +2597,10 @@ async def market_fluctuation():
             logging.info(f"Mid-day personality flip triggered (season={personality_season})")
 
     random.seed(current_day + personality_season)
+    # Default list without 'moon' (added an extra 'stable' to keep it at 7 items)
     personalities = ["stable", "rugpull", "volatile", "stable", "steady_up", "steady_down", "wildcard"]
     
+    # Only 15% chance that ONE coin gets the 'moon' personality
     if random.random() < 0.15:
         personalities[0] = "moon"
         
@@ -2453,6 +2611,7 @@ async def market_fluctuation():
     for coin in stocks:
         p = coin_personalities[coin]
 
+        # Add noise to ranges — shifts slightly every few hours
         noise = random.uniform(-0.005, 0.005)
 
         if p == "moon":
@@ -2473,6 +2632,7 @@ async def market_fluctuation():
             else:
                 change = random.uniform(-0.02 + noise, 0.02 + noise)
 
+        # Random shock event: 0.8% chance per coin per tick regardless of personality
         if random.random() < 0.008:
             shock = random.choice([-0.20, -0.15, 0.11, 0.12, 0.08])
             change += shock
@@ -2480,14 +2640,17 @@ async def market_fluctuation():
             if random.random() < 0.10:  # 10% chance to comment
                 asyncio.create_task(_shock_comment(coin, shock))
 
+        # Skip delisted coins entirely
         if coin in delisted_coins:
             continue
 
+        # --- 1. BUBBLE BURST MECHANIC ---
         if stocks[coin] > 350:
             if random.random() < 0.15: 
                 change = random.uniform(-0.35, -0.60)
                 logging.info(f"BUBBLE BURST on {coin}! Crashed by {change:+.0%}")
 
+        # --- 2. GRAVITY MECHANIC ---
         if stocks[coin] > 400:
             if change > 0:
                 change *= 0.25 # Cuts upward momentum
@@ -2498,43 +2661,61 @@ async def market_fluctuation():
         if 0 < new_price < 1.0:
             new_price = 0.0  # snap to 0 to trigger delist cleanly
 
+        # Gradual force_market nudge — pull price toward target by up to 8% per tick
         if coin in force_market_targets:
             target = force_market_targets[coin]
             diff = target - new_price
+            # Move 15% of remaining gap per tick so it feels natural
             nudge = diff * 0.15
             new_price = min(500.0, max(0.0, new_price + nudge))
             if 0 < new_price < 1.0:
                 new_price = 0.0
+            # Remove target once within 2 Aura of it
             if abs(new_price - target) < 2:
                 del force_market_targets[coin]
                 logging.info(f"force_market target reached for {coin}")
 
         stocks[coin] = new_price
 
+        # Delist if coin hits 0
         if stocks[coin] <= 0:
             stocks[coin] = 0.0
+            # Dissolve all shares — everyone loses their investment
             wiped = []
             for uid in list(portfolios.keys()):
                 if coin in portfolios[uid] and portfolios[uid][coin].get("shares", 0) > 0:
                     wiped.append(uid)
+                    # 10% liquidation payout on invested Aura
                     invested = portfolios[uid][coin].get("invested", 0.0)
                     payout = max(1, int(invested * 0.10))
                     balance[uid] += payout
                     portfolios[uid][coin] = {"shares": 0, "invested": 0.0}
+            # Delist for 2-4 hours, then relist at DEFAULT price
             import time as _time
             relist_delay = random.randint(2, 4) * 3600  # 2-4 hours in seconds
             delisted_coins[coin] = _time.time() + relist_delay
             stock_history[coin] = []
             save_data()
+            # Announce in chat channel
             ch = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
             if ch:
-                embed = discord.Embed(
-                    title="💀 COIN DELISTED",
-                    description=await quick_ai(f"Write a dramatic breaking news style announcement: the crypto coin {coin} just crashed to 0 and got delisted! {len(wiped)} holders lost their shares. They got 10% back as liquidation. It will relist in {relist_delay // 3600} hours. Keep it fun and dramatic. Max 3 sentences.", max_tokens=120) or f"**{coin}** has crashed to **0 Aura** and has been delisted!\n\n**{len(wiped)} holder(s)** had their shares dissolved. Holders received 10% back. Relists in **{relist_delay // 3600} hours**.",
-                    color=discord.Color.dark_red()
-                )
-                embed.set_footer(text="All shares have been dissolved. No payout.")
-                await ch.send(embed=embed)
+                    # 1. Get the AI response first
+                    ai_news = await quick_ai(f"Write a dramatic breaking news style announcement: the crypto coin {coin} just crashed to 0 and got delisted! {len(wiped)} holders lost their shares. They got 10% back as liquidation. It will relist in {relist_delay // 3600} hours. Keep it fun and dramatic. Max 3 sentences.", max_tokens=120)
+
+                    # 2. Escape dollar signs so Discord doesn't try to format them as math
+                    if ai_news:
+                        ai_news = ai_news.replace("$", "\\$")
+
+                    # 3. Use the fallback if the AI failed or returned a cut-off string (less than 25 chars)
+                    embed_desc = ai_news if ai_news and len(ai_news) > 25 else f"**{coin}** has crashed to **0 Aura** and has been delisted!\n\n**{len(wiped)} holder(s)** had their shares dissolved. Holders received 10% back. Relists in **{relist_delay // 3600} hours**."
+
+                    embed = discord.Embed(
+                        title="💀 COIN DELISTED",
+                        description=embed_desc,
+                        color=discord.Color.dark_red()
+                    )
+                    embed.set_footer(text="All shares have been dissolved. No payout.")
+                    await ch.send(embed=embed)
             logging.info(f"{coin} delisted, {len(wiped)} holders wiped, relists in {relist_delay//3600}h")
             continue
 
@@ -2545,10 +2726,12 @@ async def market_fluctuation():
         if len(stock_history[coin]) > 144:
             stock_history[coin].pop(0)
 
+    # Check for coins ready to relist
     import time as _time
     now_ts = _time.time()
     for coin in list(delisted_coins.keys()):
         if now_ts >= delisted_coins[coin]:
+            # Relist at default price
             relist_price = float(random.randint(10, 80))  # random relist price
             stocks[coin] = relist_price
             stock_history[coin] = [relist_price] * 10
@@ -2627,6 +2810,7 @@ async def weekly_recap_task():
     if not ch:
         return
 
+    # Top earner
     top_earner_id = max(weekly_aura_earned, key=weekly_aura_earned.get) if weekly_aura_earned else None
     top_earner_name = ""
     if top_earner_id:
@@ -2637,6 +2821,7 @@ async def weekly_recap_task():
                 break
         top_earner_name = top_earner_name or f"<@{top_earner_id}>"
 
+    # Biggest casino loser
     top_loser_id = max(weekly_casino_lost, key=weekly_casino_lost.get) if weekly_casino_lost else None
     top_loser_name = ""
     if top_loser_id:
@@ -2647,6 +2832,7 @@ async def weekly_recap_task():
                 break
         top_loser_name = top_loser_name or f"<@{top_loser_id}>"
 
+    # Biggest stock move
     best_stock = max(stocks, key=stocks.get)
     worst_stock = min(stocks, key=stocks.get)
 
@@ -2675,6 +2861,7 @@ async def weekly_recap_task():
 
     await ch.send(embed=embed)
 
+    # Reset weekly stats
     weekly_aura_earned.clear()
     weekly_casino_lost.clear()
 
@@ -2705,12 +2892,15 @@ async def science_fact_dropper():
     now = datetime.datetime.now(IST)
     today = now.date().isoformat()
 
+    # Only drop during peak hours: 6pm to 11pm IST
     if not (18 <= now.hour < 23):
         return
 
+    # Only once per day
     if last_science_fact_date == today:
         return
 
+    # 20% chance per tick so it feels random within peak window
     if random.random() > 0.20:
         return
 
@@ -2739,6 +2929,7 @@ async def daily_puzzle_scheduler():
     today = now.date().isoformat()
     hour = now.hour
 
+    # Reset all slots at midnight
     if puzzle_slots_date != today:
         puzzle_slots_date = today
         puzzle_slots = {"midnight": False, "afternoon": False, "random": False}
@@ -2747,22 +2938,30 @@ async def daily_puzzle_scheduler():
         last_puzzle_time = 0
         active_puzzle = {"question": None, "answer": None, "solved": False}
 
+    # Don't send a new puzzle if the last one was less than 1 hour ago
     if last_puzzle_time and (time.time() - last_puzzle_time) < 3600:
         return
 
+    # ── Decide which slot to try this tick ──
+    # Priority order: midnight first, then afternoon, then random.
+    # Each slot has its own time window and trigger chance.
 
     slot = None
     chance = 0.0
 
     if not puzzle_slots.get("midnight") and 0 <= hour < 1:
+        # Midnight puzzle: fires somewhere in the 12:00am–1:00am window
         slot = "midnight"
         chance = 0.40
 
     elif not puzzle_slots.get("afternoon") and 12 <= hour < 17:
+        # Afternoon puzzle: fires somewhere in the 12:00pm–5:00pm window
         slot = "afternoon"
         chance = 0.25
 
     elif not puzzle_slots.get("random") and 9 <= hour < 23:
+        # Random puzzle: can fire any time 9am–11pm.
+        # Low per-tick chance so it lands at a genuinely unpredictable time.
         slot = "random"
         chance = 0.08
 
@@ -2773,6 +2972,7 @@ async def daily_puzzle_scheduler():
     if not channel:
         return
 
+    # Pick a puzzle that hasn't been used recently
     available = [p for p in PUZZLES if p["a"] not in used_puzzles]
     if not available:
         used_puzzles.clear()
@@ -2802,6 +3002,7 @@ async def daily_puzzle_scheduler():
     }
     emoji_icon, type_name, color, hint = type_config.get(ptype, ("🧩", "Puzzle", discord.Color.purple(), "Type your answer!"))
 
+    # Slot label shown in footer so people know which puzzle this is
     slot_labels = {
         "midnight":  "🌙 Midnight Puzzle",
         "afternoon": "☀️ Afternoon Puzzle",
@@ -2949,6 +3150,7 @@ async def check_birthday_roles():
                 save_data()
 
 
+# ================== GAME COMMANDS ==================
 ROULETTE_WHEEL = [0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10, 5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26]
 RED_NUMS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 
@@ -3010,6 +3212,7 @@ async def french_roulette(i: discord.Interaction, amount: int, bet_on: str):
     result = random.randint(0, 36)
     win, payout_multiplier = check_win(result, bet_target)
 
+    # Guaranteed loss for bets over 150 — force a losing result visually
     if high_roller:
         attempts = 0
         while check_win(result, bet_target)[0] and attempts < 100:
@@ -3017,6 +3220,7 @@ async def french_roulette(i: discord.Interaction, amount: int, bet_on: str):
             attempts += 1
         win = False
         payout_multiplier = 0
+    # 15% Rigged logic (normal bets only)
     elif win and random.random() < 0.15:
         while True:
             result = random.randint(0, 36)
@@ -3030,6 +3234,7 @@ async def french_roulette(i: discord.Interaction, amount: int, bet_on: str):
     embed.description = f"{E_LOAD} **Spinning the wheel...**\n\n**Bet:** {amount:,} Aura on **{bet_target.upper()}**"
     await i.response.send_message(embed=embed)
 
+    # 3 frames only, 1.2s apart to avoid rate limits
     for _ in range(3):
         await asyncio.sleep(1.2)
         fake_idx = random.randint(0, 36)
@@ -3045,6 +3250,7 @@ async def french_roulette(i: discord.Interaction, amount: int, bet_on: str):
     display = get_wheel_string(ROULETTE_WHEEL.index(result))
     result_text = f"{get_color_emoji(result)} **{result} {res_color.upper()}**"
     
+    # La Partage Check
     partage = False
     if not win and result == 0 and bet_target in ["red", "black", "even", "odd", "high", "low"]:
         partage = True
@@ -3219,6 +3425,7 @@ async def escrow(i: discord.Interaction, opponent: discord.Member, amount: int, 
     await i.response.send_message(content=opponent.mention, embed=embed, view=view)
 
 
+# ================== ECONOMY COMMANDS ==================
 
 @bot.tree.command(name="open_withdrawals", description="Staff: Open withdrawals for X hours")
 @app_commands.describe(hours="How many hours to keep withdrawals open")
@@ -3286,7 +3493,9 @@ async def withdraw(i: discord.Interaction, amount: int, method: str, details: st
     embed.add_field(name="Details", value=f"`{details}`", inline=False)
     
     payout_msg = await payout_channel.send(embed=embed, view=PayoutView(uid, amount, method, details, str(0)))
+    # Store in pending_payouts keyed by message id for restart persistence
     pending_payouts[str(payout_msg.id)] = {"uid": uid, "amt": amount, "method": method, "details": details}
+    # Update the view with the real message id
     await payout_msg.edit(view=PayoutView(uid, amount, method, details, str(payout_msg.id)))
     save_data()
     await i.response.send_message(embed=simple_embed("✅ Request Submitted", f"Withdrawal request for **{item_str}** submitted!", discord.Color.green()), ephemeral=True)
@@ -3310,21 +3519,25 @@ async def daily(i: discord.Interaction):
         embed.set_author(name=i.user.display_name, icon_url=i.user.display_avatar.url)
         return await i.response.send_message(embed=embed, ephemeral=True)
 
+    # Update streak
     if str(last_daily.get(uid)) == yesterday:
         daily_streak[uid] += 1
     else:
         daily_streak[uid] = 1
     streak = daily_streak[uid]
 
+    # Base reward
     roll = random.randint(1, 100)
-    if roll <= 95:
+    if roll <= 99:
         amt = random.randint(1, 100)
     else:
         amt = random.randint(101, 200)
 
+    # Streak bonus: +2 Aura per day, caps at 30
     streak_bonus = min(streak, 30) * 2
     amt += streak_bonus
 
+    # Milestone bonuses
     milestone_msg = ""
     if streak == 7:
         amt += 30
@@ -3343,6 +3556,7 @@ async def daily(i: discord.Interaction):
     last_daily[uid] = today
     save_data()
 
+    # Streak label (no emoji overload)
     if streak >= 30:
         streak_label = f"{streak} days — LEGENDARY"
     elif streak >= 14:
@@ -3354,7 +3568,10 @@ async def daily(i: discord.Interaction):
     else:
         streak_label = f"{streak} day{'s' if streak > 1 else ''} — Just Started"
 
+    # Wide wheel spin — 7 slots like French roulette
     def make_wheel(slots):
+        # 5 slots, centre (index 2) is the result
+        # each slot = 5 chars, separator = 1 char → slot 2 centre = 14
         row = "|".join(f"{n:^5}" for n in slots)
         arrow = " " * 13 + "^^^"
         return f"{row}\n{arrow}"
@@ -3371,8 +3588,9 @@ async def daily(i: discord.Interaction):
             await i.edit_original_response(embed=spin_embed)
         await asyncio.sleep(0.55)
 
+    # Final wheel with result locked in centre (index 2)
     final_slots = [random.randint(1, 100) for _ in range(2)] + [amt] + [random.randint(1, 100) for _ in range(2)]
-    is_jackpot = roll > 95
+    is_jackpot = roll > 99
     color = discord.Color.gold() if is_jackpot else discord.Color.green()
     title = "JACKPOT" if is_jackpot else "Daily Claimed"
 
@@ -3388,6 +3606,24 @@ async def daily(i: discord.Interaction):
     final_embed.set_footer(text=footer)
 
     await i.edit_original_response(embed=final_embed)
+
+@bot.tree.command(name="vc_stats", description="Check how much time you've spent in voice channels")
+async def vc_stats(i: discord.Interaction, user: Optional[discord.Member] = None):
+    u = user or i.user
+    mins = vc_total_minutes.get(u.id, 0)
+    
+    hours = mins // 60
+    leftover_mins = mins % 60
+    next_milestone = next((m for m in VC_MILESTONES if m > hours), "Maxed Out")
+    
+    embed = discord.Embed(title="🎙️ Voice Channel Stats", color=discord.Color.blurple())
+    embed.set_thumbnail(url=u.display_avatar.url)
+    embed.add_field(name="User", value=u.mention, inline=False)
+    embed.add_field(name="Total Time", value=f"**{hours}h {leftover_mins}m**", inline=True)
+    embed.add_field(name="Next Milestone", value=f"**{next_milestone} hours**", inline=True)
+    embed.set_footer(text="Earn 2 Aura every 13 minutes, and 100 Aura at major hour milestones!")
+    
+    await i.response.send_message(embed=embed)
     
 @bot.tree.command(name="bal", description="Check your Aura Balance")
 async def bal(i: discord.Interaction, user: Optional[discord.Member] = None):
@@ -3560,6 +3796,7 @@ async def leaderboard(i: discord.Interaction, category: str):
         await i.response.send_message(f"Leaderboard Error: {e}", ephemeral=True)
 
 
+# ================== STOCK MARKET COMMANDS ==================
 
 class ChartStyleView(discord.ui.View):
     def __init__(self, coin: str, style: str = "line"):
@@ -3684,11 +3921,13 @@ async def coin_chart(i: discord.Interaction, coin: str):
 async def insider_tip(i: discord.Interaction, coin: str):
     global insider_uses_date, insider_uses_today
 
+    # Reset daily uses at midnight
     today_str = datetime.datetime.now(IST).date().isoformat()
     if insider_uses_date != today_str:
         insider_uses_date = today_str
         insider_uses_today.clear()
 
+    # 2 uses per person per day
     if insider_uses_today[i.user.id] >= 2:
         return await i.response.send_message("🛑 You've already used your 2 insider tips for today. Come back tomorrow.", ephemeral=True)
 
@@ -3709,6 +3948,7 @@ async def insider_tip(i: discord.Interaction, coin: str):
 
     p = coin_personalities[coin]
 
+    # 10% chance of wrong info
     if random.random() < 0.20:
         other = [x for x in personalities if x != p]
         p = random.choice(other)
@@ -3792,6 +4032,7 @@ async def sell_cmd(i: discord.Interaction, coin: str, shares: int):
     if current_shares < shares:
         return await i.response.send_message(f"You only have {current_shares} shares of {coin}.", ephemeral=True)
         
+    # Retroactive cap fix just in case they hold more than the max limit
     if current_shares > MAX_SHARES_PER_COIN:
         ratio = MAX_SHARES_PER_COIN / current_shares
         portfolios[i.user.id][coin]["shares"] = MAX_SHARES_PER_COIN
@@ -3868,6 +4109,7 @@ async def portfolio_cmd(i: discord.Interaction, user: Optional[discord.Member] =
     await i.response.send_message(embed=embed)
 
     
+#--------------invite event---------------------
 @bot.tree.command(name="invite_event", description="Staff: Start or end the invite event")
 @app_commands.describe(action="start or end")
 @app_commands.choices(action=[
@@ -3887,6 +4129,7 @@ async def invite_event_cmd(i: discord.Interaction, action: str):
         invite_event_active = True
         invite_counts.clear()
         invite_map.clear()
+        # Cache fresh invites
         for guild in bot.guilds:
             try:
                 cached_invites[guild.id] = {inv.code: inv.uses for inv in await guild.invites()}
@@ -3923,14 +4166,17 @@ async def invite_event_cmd(i: discord.Interaction, action: str):
         invite_event_active = False
         save_data()
 
+        # Sort by invites
         sorted_inv = sorted(invite_counts.items(), key=lambda x: x[1], reverse=True)
         prizes = {0: "$10", 1: "$5", 2: "$2", 3: "$2", 4: "$1"}
 
+        # Give 20 Aura per invite
         for uid, count in sorted_inv:
             if count > 0:
                 balance[uid] += count * 20
         save_data()
 
+        # Build results embed
         desc = "**Event has ended! Here are the final results:**\n\n"
         for idx, (uid, count) in enumerate(sorted_inv[:10]):
             member = i.guild.get_member(uid) if i.guild else None
@@ -3977,6 +4223,28 @@ async def close_all_tickets(i: discord.Interaction):
 
 
 
+# ================== STAFF SETUP & UTILITY COMMANDS ==================
+@bot.tree.command(name="add", description="Staff: Add a user to this current channel")
+async def add_user_to_current_channel(i: discord.Interaction, user: discord.Member):
+    if not is_staff(i.user):
+        return await i.response.send_message("Staff only.", ephemeral=True)
+
+    try:
+        # i.channel automatically targets the channel the command was typed in
+        await i.channel.set_permissions(
+            user, 
+            view_channel=True, 
+            read_messages=True, 
+            send_messages=True, 
+            attach_files=True, 
+            embed_links=True
+        )
+        await i.response.send_message(f"✅ Granted {user.mention} access to {i.channel.mention}.", ephemeral=True)
+    except discord.Forbidden:
+        await i.response.send_message("❌ I don't have permission to edit this channel's permissions. Check my role hierarchy.", ephemeral=True)
+    except Exception as e:
+        await i.response.send_message(f"❌ Failed: {e}", ephemeral=True)
+        
 
 @bot.tree.command(name="roast", description="Roast someone (or yourself)")
 async def roast(i: discord.Interaction, user: discord.Member):
@@ -4125,6 +4393,7 @@ async def end_giveaway_now(i: discord.Interaction):
     if not active:
         return await i.response.send_message("No active giveaways running right now.", ephemeral=True)
 
+    # Pick the one ending soonest
     gid, g = min(active, key=lambda x: x[1]["end_time"])
 
     await i.response.send_message(f"⏩ Ending giveaway for **{g['prize']}** instantly...", ephemeral=True)
@@ -4210,6 +4479,7 @@ async def ban_user(i: discord.Interaction, user: discord.Member, reason: str = "
 @app_commands.choices(coin=[app_commands.Choice(name=c, value=c) for c in DEFAULT_STOCKS.keys()])
 @app_commands.default_permissions(administrator=True) # Hides it from regular users in the menu
 async def force_market(i: discord.Interaction, coin: str, target_price: float):
+    # 1. Strict Role Check (Only this exact Role ID can pass)
     ADMIN_ROLE_ID = 1448719741756768308
     has_admin_role = any(role.id == ADMIN_ROLE_ID for role in i.user.roles)
     
@@ -4219,8 +4489,10 @@ async def force_market(i: discord.Interaction, coin: str, target_price: float):
     if target_price < 0:
         return await i.response.send_message("Target price cannot be negative.", ephemeral=True)
         
+    # 2. Inject target into the background loop
     force_market_targets[coin] = target_price
     
+    # 3. Secret confirmation
     await i.response.send_message(
         f"🤫 **Market Manipulated:** The invisible hand has been activated.\n"
         f"**{coin}** will now gradually gravitate towards **{target_price} Aura** over the next few hours.", 
@@ -4394,6 +4666,7 @@ async def list_role(i: discord.Interaction, role: discord.Role):
 
     
 
+#-------------------tickets-------------------------------
 @bot.tree.command(name="verify", description="Staff: Verify ticket")
 async def verify(i: discord.Interaction, user: discord.Member, role1: Optional[discord.Role]=None, role2: Optional[discord.Role]=None, role3: Optional[discord.Role]=None):
     if not is_staff(i.user) or not is_ticket_channel(i.channel): 
@@ -4476,6 +4749,7 @@ async def hardsync(ctx):
         
     msg = await ctx.send("🔄 **Syncing commands...**\n1️⃣ Clearing guild-specific duplicates...")
     try:
+        # Clear guild-specific copies that cause duplicates
         bot.tree.clear_commands(guild=ctx.guild)
         await bot.tree.sync(guild=ctx.guild)
         
@@ -4511,6 +4785,7 @@ async def force_recap(i: discord.Interaction):
     if not ch:
         return await i.followup.send("Announce channel not found.", ephemeral=True)
 
+    # Top earner
     top_earner_id = max(weekly_aura_earned, key=weekly_aura_earned.get) if weekly_aura_earned else None
     top_earner_name = ""
     if top_earner_id:
@@ -4521,6 +4796,7 @@ async def force_recap(i: discord.Interaction):
                 break
         top_earner_name = top_earner_name or f"<@{top_earner_id}>"
 
+    # Biggest casino loser
     top_loser_id = max(weekly_casino_lost, key=weekly_casino_lost.get) if weekly_casino_lost else None
     top_loser_name = ""
     if top_loser_id:
@@ -4531,6 +4807,7 @@ async def force_recap(i: discord.Interaction):
                 break
         top_loser_name = top_loser_name or f"<@{top_loser_id}>"
 
+    # Biggest stock move
     best_stock = max(stocks, key=stocks.get) if stocks else "None"
     worst_stock = min(stocks, key=stocks.get) if stocks else "None"
 
@@ -4542,6 +4819,7 @@ async def force_recap(i: discord.Interaction):
         f"Lowest priced stock: {worst_stock} at {stocks.get(worst_stock, 0):.1f} Aura. "
         f"Be funny, engaging, like a sports commentator. 4 sentences max."
     )
+    # Giving it 600 tokens so it never gets cut off
     recap = await quick_ai(prompt, max_tokens=600)
 
     embed = discord.Embed(
@@ -4572,6 +4850,7 @@ async def force_puzzle_cmd(i: discord.Interaction):
     if not channel:
         return await i.response.send_message("Chat channel not found.", ephemeral=True)
         
+    # Pick a puzzle
     available = [p for p in PUZZLES if p["a"] not in used_puzzles]
     if not available:
         used_puzzles.clear()
@@ -4580,12 +4859,14 @@ async def force_puzzle_cmd(i: discord.Interaction):
     puzzle = random.choice(available)
     used_puzzles.append(puzzle["a"])
     
+    # Activate it
     active_puzzle["question"] = puzzle["q"]
     active_puzzle["answer"] = puzzle["a"]
     active_puzzle["type"] = puzzle.get("type", "riddle")
     active_puzzle["solved"] = False
     save_data()
     
+    # Build the embed
     ptype = active_puzzle["type"]
     type_config = {
         "riddle":    ("🧩", "Riddle",            discord.Color.purple(),  "Think carefully and type your answer!"),
@@ -4607,4 +4888,28 @@ async def force_puzzle_cmd(i: discord.Interaction):
     await channel.send(embed=embed)
     await i.response.send_message("✅ Puzzle forced into the chat!", ephemeral=True)
     
+@bot.tree.command(name="add_role_to_tickets", description="Staff: Grant a role access to all current ticket channels")
+async def add_role_to_tickets(i: discord.Interaction, role: discord.Role):
+    if not is_staff(i.user):
+        return await i.response.send_message("Staff only.", ephemeral=True)
+        
+    # Defer the response because updating many channels can take a few seconds
+    await i.response.defer(ephemeral=True)
+    
+    # Combine both your standard ticket categories and the payment category
+    all_ticket_categories = TICKET_CATEGORY_IDS | {PAYMENT_TICKET_CATEGORY_ID}
+    updated_count = 0
+    
+    for channel in i.guild.text_channels:
+        if channel.category and channel.category.id in all_ticket_categories:
+            try:
+                # Grant the role permission to view and send messages in the ticket
+                await channel.set_permissions(role, view_channel=True, read_messages=True, send_messages=True)
+                updated_count += 1
+            except Exception as e:
+                import logging
+                logging.error(f"Failed to update permissions for {channel.name}: {e}")
+                
+    await i.followup.send(f"✅ Successfully granted {role.mention} access to **{updated_count}** ticket channels.", ephemeral=True)
+
 bot.run(TOKEN)
