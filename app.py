@@ -14,6 +14,145 @@ from collections import defaultdict, deque
 from typing import Optional
 from google import genai
 from google.genai import types
+import gspread
+import requests
+import uuid
+from discord.ext import tasks
+# ==========================================
+# REMINDER SYSTEM ENGINE
+# ==========================================
+REMINDERS_FILE = "reminders.json"
+
+def load_reminders():
+    if os.path.exists(REMINDERS_FILE):
+        with open(REMINDERS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_reminders(data):
+    with open(REMINDERS_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+reminders_db = load_reminders()
+
+@tasks.loop(minutes=1)
+async def master_reminder_loop():
+    # Define India Standard Time (UTC + 5 hours 30 mins)
+    IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    now = datetime.datetime.now(IST)
+    
+    # %H:%M forces strict 24-hour format (e.g., "14:00" or "09:30")
+    current_time = now.strftime("%H:%M")
+    current_day_name = now.strftime("%A").lower()
+    current_date_num = str(now.day)
+    
+    for rem_id, data in list(reminders_db.items()):
+        if data['time'] == current_time:
+            should_send = False
+            
+            # Check if it matches the Weekly or Monthly criteria
+            if data['freq'] == 'weekly' and data['day_or_date'].lower() == current_day_name:
+                should_send = True
+            elif data['freq'] == 'monthly' and data['day_or_date'] == current_date_num:
+                should_send = True
+                
+            if should_send:
+                channel = bot.get_channel(data['channel'])
+                if channel:
+                    try:
+                        # Determine the exact title without emojis
+                        if data['freq'] == 'weekly':
+                            header = "Weekly Reminder"
+                        else:
+                            header = "Monthly Reminder"
+                            
+                        # Format as a standard text message so pings work perfectly
+                        final_message = f"**{header}**\n{data['message']}"
+                        
+                        # Send as plain text, no embed
+                        await channel.send(content=final_message)
+                        
+                    except Exception as e:
+                        print(f"Could not send reminder: {e}")
+# ==========================================
+# GOOGLE SHEETS SETUP 
+# ==========================================
+print("🔄 Attempting to connect to Google Sheets...")
+try:
+    gc = gspread.service_account(filename="gcp-key.json")
+    print("✅ Google Sheets connected successfully!")
+except Exception as e:
+    gc = None
+    print(f"🚨 CRITICAL ERROR: Could not connect to Google Sheets! Reason: {e}")
+
+# ==========================================
+# REDDIT SCRAPER ENGINE (JSON UPGRADE)
+# ==========================================
+def check_reddit_post(url: str) -> str:
+    """Checks the status of a Reddit post or comment using the raw JSON data."""
+    try:
+        # Clean URL and convert to raw JSON request
+        base_url = url.split('?')[0].rstrip('/')
+        base_url = base_url.replace("old.reddit.com", "www.reddit.com")
+        json_url = f"{base_url}.json"
+        
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KataBump/2.0"}
+        response = requests.get(json_url, headers=headers, timeout=10)
+        
+        if response.status_code == 404:
+            return "invalid"
+        elif response.status_code != 200:
+            return "error"
+            
+        data = response.json()
+        
+        # Determine if the worker linked a Comment or a Post
+        is_comment = False
+        parts = base_url.split('/')
+        if 'comments' in parts:
+            comments_idx = parts.index('comments')
+            # If the URL is long enough to have a comment ID at the end
+            if len(parts) > comments_idx + 3: 
+                is_comment = True
+                
+        if is_comment:
+            # STRICT COMMENT CHECK (Ignores the parent post)
+            if len(data) == 2 and len(data[1]['data']['children']) > 0:
+                comment_data = data[1]['data']['children'][0]['data']
+                body = comment_data.get('body', '')
+                author = comment_data.get('author', '')
+                
+                if body == '[removed]':
+                    return "filtered"
+                elif body == '[deleted]' or author == '[deleted]':
+                    return "deleted"
+                else:
+                    return "active"
+            else:
+                # If the comment data is completely missing, it was hard-deleted
+                return "deleted"
+        else:
+            # STRICT POST CHECK
+            post_data = data[0]['data']['children'][0]['data']
+            selftext = post_data.get('selftext', '')
+            author = post_data.get('author', '')
+            removed_category = post_data.get('removed_by_category')
+            
+            if removed_category == 'moderator':
+                return "mod_removed"
+            elif removed_category in ['reddit', 'anti_evil_ops'] or selftext == '[removed]':
+                return "filtered"
+            elif removed_category == 'deleted' or selftext == '[deleted]' or author == '[deleted]':
+                return "deleted"
+            else:
+                return "active"
+                
+    except Exception as e:
+        print(f"Reddit JSON check failed: {e}")
+        return "error"
+
+   
+    
 # ================== ENV & LOGGING ==================
 load_dotenv()
 # Use your Project ID from the screenshot
@@ -29,7 +168,7 @@ CRICKET_API_KEY = os.getenv("CRICKET_API", "")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-AI_SYSTEM = """You are baby_no_one, the bot of this Discord server. Smart, bully, chill, a bit witty. You feel like a real member, not a robot.
+AI_SYSTEM = r"""You are baby_no_one, the bot of this Discord server. Smart, bully, chill, a bit witty. You feel like a real member, not a robot.
 
 RESPONSE RULES:
 - CRITICAL KNOWLEDGE - SERVER TASKS:
@@ -2109,6 +2248,8 @@ async def on_ready():
     # Restore randomizer bags from disk so no repeats across restarts
     yo_bag.load(data.get("yo_bag", []))
     roast_bag.load(data.get("roast_bag", []))
+    if not master_reminder_loop.is_running():
+        master_reminder_loop.start()
 
     # Retroactively trim any portfolios over MAX_SHARES_PER_COIN and refund the excess invested Aura
     trimmed = 0
@@ -4911,5 +5052,148 @@ async def add_role_to_tickets(i: discord.Interaction, role: discord.Role):
                 logging.error(f"Failed to update permissions for {channel.name}: {e}")
                 
     await i.followup.send(f"✅ Successfully granted {role.mention} access to **{updated_count}** ticket channels.", ephemeral=True)
+    
+# ==========================================
+# VERIFY SHEET COMMAND (V3)
+# ==========================================
+@bot.tree.command(name="verify_sheet", description="Staff: Grade a task sheet and push to Master Pay Sheet")
+async def verify_sheet(i: discord.Interaction, sheet_url: str):
+    # Adjust role check if necessary
+    if not i.user.guild_permissions.manage_messages: 
+        return await i.response.send_message("Staff only.", ephemeral=True)
+        
+    await i.response.defer()
+    
+    if gc is None:
+        return await i.followup.send("❌ Google Sheets API is disconnected.")
 
+    try:
+        user_sheet = gc.open_by_url(sheet_url).sheet1
+        discord_name = user_sheet.acell('B2').value or str(i.user.name)
+        payment_address = user_sheet.acell('B3').value or "NO ADDRESS PROVIDED"
+        profile_link = user_sheet.acell('C5').value or ""
+        
+        rows = user_sheet.get_all_values()
+        stats = {"active": 0, "mod_removed": 0, "filtered": 0, "invalid": 0}
+        updates = [] 
+        
+        # --- PHASE 1: LOCATE THE TOTAL EARNINGS CELL ---
+        total_row_idx = None
+        total_col_idx = None
+        
+        for r_idx, r in enumerate(rows[:20]): 
+            row_text = [str(cell).lower().strip() for cell in r]
+            if "total earnings:" in row_text or "total earnings" in row_text:
+                for c_idx, cell in reversed(list(enumerate(r))):
+                    if str(cell).strip() != "" and "total" not in str(cell).lower() and str(cell) != "FALSE":
+                        total_row_idx = r_idx + 1 # Gspread uses 1-based indexing
+                        total_col_idx = c_idx + 1
+                        break
+
+        # --- BULLETPROOF LINK FINDER ---
+        # Dynamically scan below the Total Earnings row so we don't accidentally grade their profile link
+        start_row = total_row_idx if total_row_idx else 11
+        
+        for row_idx in range(start_row, len(rows)):
+            row = rows[row_idx]
+            url = None
+            
+            for c_idx in range(len(row)):
+                cell_str = str(row[c_idx]).lower()
+                if "reddit.com" in cell_str or "redd.it" in cell_str:
+                    url = str(row[c_idx])
+                    break 
+            
+            if url:
+                status = check_reddit_post(url)
+                sheet_row = row_idx + 1 
+                
+                if status == "active":
+                    stats["active"] += 1
+                elif status == "mod_removed":
+                    stats["mod_removed"] += 1
+                    updates.append({'range': f'H{sheet_row}', 'values': [[True]]})
+                elif status in ["filtered", "deleted"]:
+                    stats["filtered"] += 1
+                    updates.append({'range': f'G{sheet_row}', 'values': [[True]]})
+                else:
+                    stats["invalid"] += 1
+
+        # Apply the penalty checkboxes to the sheet
+        if updates:
+            user_sheet.batch_update(updates)
+            
+        # --- PHASE 2: RE-FETCH UPDATED MATH ---
+        # Give Google Sheets 4 seconds to apply deductions based on the checked boxes
+        await asyncio.sleep(4.0) 
+        
+        final_amount = "$0.00"
+        if total_row_idx and total_col_idx:
+            # Pull exactly that one cell again to get the final post-deduction number
+            updated_cell = user_sheet.cell(total_row_idx, total_col_idx)
+            final_amount = str(updated_cell.value)
+        
+        # Push to Master Sheet
+        MASTER_SHEET_URL = "https://docs.google.com/spreadsheets/d/16LsJL4-1Rv8gWbmjpS7GkC9HOmD1JAvLBYcWnGRkpHM/edit"
+        master_doc = gc.open_by_url(MASTER_SHEET_URL)
+        master_sheet = master_doc.get_worksheet(0) 
+        
+        master_sheet.append_row(["FALSE", discord_name, final_amount, payment_address, "", profile_link])
+        
+        embed = discord.Embed(title="🧾 Task Sheet Graded & Logged", color=0x00FF00)
+        embed.description = f"Successfully graded tasks for **{discord_name}** and logged them to the Master Sheet."
+        embed.add_field(name="✅ Active", value=str(stats['active']), inline=True)
+        embed.add_field(name="⚠️ Mod Removed (50%)", value=str(stats['mod_removed']), inline=True)
+        embed.add_field(name="❌ Filtered/Deleted", value=str(stats['filtered']), inline=True)
+        embed.add_field(name="💰 Final Payout Logged", value=f"**{final_amount}**", inline=False)
+        
+        await i.followup.send(embed=embed)
+        
+    except Exception as e:
+        await i.followup.send(f"❌ Failed to verify sheet. Error: `{e}`") 
+# ==========================================
+# REMINDER COMMANDS
+# ==========================================
+@bot.tree.command(name="set_reminder", description="Set a repeating reminder in this channel")
+@app_commands.choices(frequency=[
+    app_commands.Choice(name="Weekly (e.g. thursday)", value="weekly"),
+    app_commands.Choice(name="Monthly (e.g. 1)", value="monthly")
+])
+async def set_reminder(i: discord.Interaction, frequency: app_commands.Choice[str], day_or_date: str, time_ist: str, message: str):
+    
+    # Validation checks
+    if frequency.value == "weekly" and day_or_date.lower() not in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
+        return await i.response.send_message("❌ For weekly reminders, type a full day name (e.g., 'thursday').", ephemeral=True)
+    if frequency.value == "monthly" and not day_or_date.isdigit():
+        return await i.response.send_message("❌ For monthly reminders, type a number from 1 to 31.", ephemeral=True)
+        
+    rem_id = str(uuid.uuid4().hex)[:6] 
+    
+    reminders_db[rem_id] = {
+        "channel": i.channel.id,
+        "freq": frequency.value,
+        "day_or_date": day_or_date.lower(),
+        "time": time_ist, # Now saves whatever 24h IST time you type
+        "message": message,
+        "author": i.user.id
+    }
+    save_reminders(reminders_db)
+    
+    await i.response.send_message(
+        f"✅ **Reminder Set!** (ID: `{rem_id}`)\n"
+        f"I will send this message here every **{day_or_date.capitalize()}** at **{time_ist} IST**."
+    )
+
+@bot.tree.command(name="cancel_reminder", description="Cancel a reminder using its ID")
+async def cancel_reminder(i: discord.Interaction, reminder_id: str):
+    if reminder_id in reminders_db:
+        del reminders_db[reminder_id]
+        save_reminders(reminders_db)
+        await i.response.send_message(f"🗑️ Deleted reminder `{reminder_id}`.")
+    else:
+        # If they type the wrong ID, show them the active ones in that channel to help them out
+        active = "\n".join([f"`{k}`: {v['freq']} on {v['day_or_date']} at {v['time']}" for k, v in reminders_db.items() if v['channel'] == i.channel.id])
+        if not active:
+            active = "There are no active reminders in this channel."
+        await i.response.send_message(f"❌ Reminder ID not found. Active reminders here:\n{active}", ephemeral=True)
 bot.run(TOKEN)
