@@ -1,0 +1,26 @@
+{
+    "681cdd": {
+        "channel": 1480466976211075225,
+        "freq": "weekly",
+        "day_or_date": "wednesday",
+        "time": "00:00",
+        "message": "i love u <@992008865656868946>",
+        "author": 992008865656868946
+    },
+    "d7b240": {
+        "channel": 1480466976211075225,
+        "freq": "weekly",
+        "day_or_date": "wednesday",
+        "time": "10:15",
+        "message": "i hate u <@992008865656868946>",
+        "author": 992008865656868946
+    },
+    "f015e1": {
+        "channel": 1484527138890580099,
+        "freq": "weekly",
+        "day_or_date": "thursday",
+        "time": "00:00",
+        "message": "# Please update and get the analytics ready for the respective clients and share it by staurday evening ! @everyone",
+        "author": 992008865656868946
+    }
+}
