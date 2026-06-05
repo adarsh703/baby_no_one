@@ -18,6 +18,83 @@ import gspread
 import requests
 import uuid
 from discord.ext import tasks
+import re
+import urllib.parse
+
+
+
+load_dotenv()
+# ==========================================
+# INTERACTIVE LEADERBOARD PAGINATOR
+# ==========================================
+class LeaderboardView(discord.ui.View):
+    def __init__(self, data_list, guild, label, emoji, user, per_page=10):
+        super().__init__(timeout=180) # Buttons disable after 3 minutes
+        self.data_list = data_list
+        self.guild = guild
+        self.label = label
+        self.emoji = emoji
+        self.user = user
+        self.per_page = per_page
+        self.current_page = 0
+        self.max_pages = max(1, math.ceil(len(self.data_list) / self.per_page))
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page >= self.max_pages - 1
+
+    def generate_embed(self):
+        embed = discord.Embed(
+            title=f"🏆 Server Leaderboard | {self.label}", 
+            color=discord.Color.gold()
+        )
+        
+        if self.guild and self.guild.icon: 
+            embed.set_thumbnail(url=self.guild.icon.url)
+
+        # Grab the right slice of data for the current page
+        start_idx = self.current_page * self.per_page
+        end_idx = start_idx + self.per_page
+        page_data = self.data_list[start_idx:end_idx]
+        
+        desc = ""
+        for idx, (u, v) in enumerate(page_data):
+            actual_rank = start_idx + idx + 1
+            
+            if actual_rank == 1: rank_str = "🥇"
+            elif actual_rank == 2: rank_str = "🥈"
+            elif actual_rank == 3: rank_str = "🥉"
+            else: rank_str = f"` #{actual_rank} `"
+
+            # Lookup member name dynamically
+            member = self.guild.get_member(int(u)) if self.guild else None
+            name = member.display_name if member else f"<@{u}>"
+            desc += f"{rank_str} {name} — **{int(v):,}** {self.emoji}\n\n"
+            
+        embed.description = desc or "No data available."
+        embed.set_footer(
+            text=f"Page {self.current_page + 1} of {self.max_pages} • Total: {len(self.data_list)} | Requested by {self.user.display_name}", 
+            icon_url=self.user.display_avatar.url
+        )
+        
+        return embed
+
+    @discord.ui.button(label="◀️ Previous", style=discord.ButtonStyle.blurple)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.user:
+            return await interaction.response.send_message("❌ You can't flip pages on someone else's leaderboard!", ephemeral=True)
+        self.current_page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.generate_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.blurple)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.user:
+            return await interaction.response.send_message("❌ You can't flip pages on someone else's leaderboard!", ephemeral=True)
+        self.current_page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.generate_embed(), view=self)
 # ==========================================
 # REMINDER SYSTEM ENGINE
 # ==========================================
@@ -85,76 +162,130 @@ except Exception as e:
     gc = None
     print(f"🚨 CRITICAL ERROR: Could not connect to Google Sheets! Reason: {e}")
 
-# ==========================================
-# REDDIT SCRAPER ENGINE (JSON UPGRADE)
-# ==========================================
-def check_reddit_post(url: str) -> str:
-    """Checks the status of a Reddit post or comment using the raw JSON data."""
+# --- 1. NEW REDDIT API FUNCTIONS ---
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+USER_AGENT = "linux:MyDiscordBot:v1.0 (by /u/Dizzy_Sensee)"
+
+async def get_reddit_token():
+    auth = aiohttp.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
+    data = {'grant_type': 'client_credentials'}
+    headers = {'User-Agent': USER_AGENT}
+    async with aiohttp.ClientSession() as session:
+        async with session.post('https://www.reddit.com/api/v1/access_token', auth=auth, data=data, headers=headers) as resp:
+            if resp.status == 200:
+                token_data = await resp.json()
+                return token_data.get('access_token')
+            return None
+from bs4 import BeautifulSoup 
+
+async def get_reddit_token():
+    auth = aiohttp.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
+    data = {'grant_type': 'client_credentials'}
+    headers = {'User-Agent': USER_AGENT}
+    async with aiohttp.ClientSession() as session:
+        async with session.post('https://www.reddit.com/api/v1/access_token', auth=auth, data=data, headers=headers) as resp:
+            if resp.status == 200:
+                token_data = await resp.json()
+                return token_data.get('access_token')
+            return None
+
+async def verify_reddit_post(url: str, token: str):
+    # --- The Disguise: Put this on immediately for mobile links ---
+    headers = {
+        'Authorization': f'Bearer {token}', 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
+    # 1. Handle redirects for /s/ mobile links and resolve the actual URL
     try:
-        # Clean URL and convert to raw JSON request
-        base_url = url.split('?')[0].rstrip('/')
-        base_url = base_url.replace("old.reddit.com", "www.reddit.com")
-        json_url = f"{base_url}.json"
-        
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KataBump/2.0"}
-        response = requests.get(json_url, headers=headers, timeout=10)
-        
-        if response.status_code == 404:
-            return "invalid"
-        elif response.status_code != 200:
-            return "error"
-            
-        data = response.json()
-        
-        # Determine if the worker linked a Comment or a Post
-        is_comment = False
-        parts = base_url.split('/')
-        if 'comments' in parts:
-            comments_idx = parts.index('comments')
-            # If the URL is long enough to have a comment ID at the end
-            if len(parts) > comments_idx + 3: 
-                is_comment = True
-                
-        if is_comment:
-            # STRICT COMMENT CHECK (Ignores the parent post)
-            if len(data) == 2 and len(data[1]['data']['children']) > 0:
-                comment_data = data[1]['data']['children'][0]['data']
-                body = comment_data.get('body', '')
-                author = comment_data.get('author', '')
-                
-                if body == '[removed]':
-                    return "filtered"
-                elif body == '[deleted]' or author == '[deleted]':
-                    return "deleted"
-                else:
-                    return "active"
-            else:
-                # If the comment data is completely missing, it was hard-deleted
-                return "deleted"
-        else:
-            # STRICT POST CHECK
-            post_data = data[0]['data']['children'][0]['data']
-            selftext = post_data.get('selftext', '')
-            author = post_data.get('author', '')
-            removed_category = post_data.get('removed_by_category')
-            
-            if removed_category == 'moderator':
-                return "mod_removed"
-            elif removed_category in ['reddit', 'anti_evil_ops'] or selftext == '[removed]':
-                return "filtered"
-            elif removed_category == 'deleted' or selftext == '[deleted]' or author == '[deleted]':
-                return "deleted"
-            else:
-                return "active"
-                
+        async with aiohttp.ClientSession() as session:
+            # The headers are passed here so Reddit lets the bot through!
+            async with session.get(url, headers=headers, allow_redirects=True, timeout=7) as resp:
+                final_url = str(resp.url)
     except Exception as e:
-        print(f"Reddit JSON check failed: {e}")
-        return "error"
+        print(f"DEBUG: Failed to unwrap link: {e}")
+        return "Failed"
+
+    if "comments/" not in final_url:
+        return "Invalid Link"
+
+    # 2. Smart ID Extraction: Determine if this is a Post OR a Comment
+    try:
+        parts = final_url.split('/comments/')[1].split('/')
+        post_id = parts[0].split('?')[0]
+        comment_id = None
+        
+        # A standard comment URL looks like: .../comments/post_id/title/comment_id/
+        if len(parts) >= 3 and parts[2] and '?' not in parts[2]:
+            comment_id = parts[2].split('?')[0]
+            
+        # Target t1_ (Comment) if it exists, otherwise fallback to t3_ (Post)
+        target_id = f"t1_{comment_id}" if comment_id else f"t3_{post_id}"
+    except Exception:
+        return "Invalid Link"
+        
+    api_url = f"https://oauth.reddit.com/api/info/?id={target_id}"
+    
+    # 3. Read the Data from Reddit
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, headers=headers) as resp:
+                if resp.status == 429: return "Rate Limited"
+                if resp.status != 200: return "API Error"
+                
+                data = await resp.json()
+                children = data.get('data', {}).get('children', [])
+                if not children: return "Deleted"
+                
+                item_data = children[0]['data']
+                
+                # 4. Advanced Classification Variables
+                author = item_data.get('author')
+                body = item_data.get('body', '')
+                selftext = item_data.get('selftext', '')
+                removed_category = item_data.get('removed_by_category')
+                is_indexable = item_data.get('is_robot_indexable', True)
+                banned_by = item_data.get('banned_by')
+                spam = item_data.get('spam', False)
+                
+                # A. Deleted by User
+                if author == '[deleted]' or removed_category in ['deleted', 'author']:
+                    return "Deleted"
+                    
+                # B. Explicitly Filtered (Reddit's Automated Systems & Spam Filters)
+                if removed_category in ['reddit', 'automod_filtered', 'anti_evil_ops'] or spam is True or banned_by is True:
+                    return "Filtered"
+                    
+                # C. Explicitly Removed by a Human Moderator
+                if removed_category == 'moderator' or (isinstance(banned_by, str) and str(banned_by).lower() not in ['true', 'false']):
+                    return "Mod Removed"
+                    
+                # D. The "[removed]" Text Fallback (When Reddit's API hides the tags)
+                if body == '[removed]' or selftext == '[removed]':
+                    # If a COMMENT is [removed] but has no tags, it was killed by a Moderator
+                    if target_id.startswith('t1_'):
+                        return "Mod Removed"
+                    # If a POST is [removed] but has no tags, it was killed by Automod/Spam filters
+                    else:
+                        return "Filtered"
+                        
+                # E. Fallback for Posts: Not indexable usually means awaiting mod approval or shadow-removed
+                if target_id.startswith('t3_') and not is_indexable:
+                    return "Filtered"
+                    
+                return "Active"
+            
+    except Exception as e:
+        print(f"DEBUG API ERROR: {e}")
+        return "Failed"
+
+
 
    
     
 # ================== ENV & LOGGING ==================
-load_dotenv()
+
 # Use your Project ID from the screenshot
 vertex_client = genai.Client(
     vertexai=True, 
@@ -168,7 +299,7 @@ CRICKET_API_KEY = os.getenv("CRICKET_API", "")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-AI_SYSTEM = r"""You are baby_no_one, the bot of this Discord server. Smart, bully, chill, a bit witty. You feel like a real member, not a robot.
+AI_SYSTEM = r"""You are baby_no_one, the bot of this Discord server. Smart, bully, chill, a bit witty. You feel like a real member, not a robot. talk about aura and server stocks less frequently
 
 RESPONSE RULES:
 - CRITICAL KNOWLEDGE - SERVER TASKS:
@@ -628,7 +759,9 @@ AURA_TO_USD = 1000
 MAX_SHARES_PER_COIN = 30  # Max shares per person per coin
 MAX_DAILY_SELL_EARNINGS = 2000  # Max Aura per person per day from selling stocks ($2)
 
+
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
 
 E_LOAD = "<a:waiting:1456284110556237925>"
 E_COIN = "<:wallet_Binance:1488205979362525325>"
@@ -820,7 +953,6 @@ def load_data():
 
 data = load_data()
 # Bags loaded after SmartRandomizer class is defined below
-
 message_count = defaultdict(int, {int(k): v for k, v in data.get("messages", {}).items()})
 balance = defaultdict(int, {int(k): v for k, v in data.get("balance", {}).items()})
 last_daily = defaultdict(str, {int(k): str(v) for k, v in data.get("last_daily", {}).items()})
@@ -850,8 +982,8 @@ casino_losses = defaultdict(int, {int(k): v for k, v in data.get("casino_losses"
 casino_wins = defaultdict(int, {int(k): v for k, v in data.get("casino_wins", {}).items()})
 weekly_stock_start = data.get("weekly_stock_start", {})
 last_mood_check = None
-weekly_aura_earned = defaultdict(int)   # uid -> aura earned this week
-weekly_casino_lost = defaultdict(int)   # uid -> aura lost in casino this week
+weekly_aura_earned = defaultdict(int, {int(k): v for k, v in data.get("weekly_aura_earned", {}).items()})
+weekly_casino_lost = defaultdict(int, {int(k): v for k, v in data.get("weekly_casino_lost", {}).items()})
 weekly_start_balance = {}               # uid -> balance at week start
 channel_chat_log = {}  # channel_id -> deque of recent messages
 server_channel_knowledge = {}  # channel_name -> content
@@ -859,6 +991,7 @@ server_custom_emojis = ""
 user_persistent_memory = {}  # user_id -> list of key facts  # formatted emoji list for AI prompt
 delisted_coins = data.get("delisted_coins", {})
 user_persistent_memory = {int(k): v for k, v in data.get("user_persistent_memory", {}).items()}
+last_message_times = data.get("last_message_times", {})
 pending_reminders = data.get("pending_reminders", [])  # list of {user_id, channel_id, message, time}
 invite_event_active = data.get("invite_event_active", False)
 invite_counts = defaultdict(int, {int(k): v for k, v in data.get("invite_counts", {}).items()})  # inviter_id -> valid invite count
@@ -911,10 +1044,13 @@ def save_data():
                 "roast_bag": roast_bag.bag,
                 "delisted_coins": delisted_coins,
                 "user_persistent_memory": {str(k): v for k, v in user_persistent_memory.items()},
+                "last_message_times": dict(last_message_times),
                 "pending_reminders": pending_reminders,
                 "balance_milestones_announced": list(balance_milestones_announced),
                 "casino_losses": dict(casino_losses),
                 "casino_wins": dict(casino_wins),
+                "weekly_aura_earned": dict(weekly_aura_earned),
+                "weekly_casino_lost": dict(weekly_casino_lost),
                 "weekly_stock_start": weekly_stock_start,
                 "invite_event_active": invite_event_active,
                 "invite_counts": dict(invite_counts),
@@ -924,7 +1060,7 @@ def save_data():
         logging.error(f"Error saving data: {e}")
 
 # ================== HELPERS & CHARTING ==================
-TICKET_CATEGORY_IDS = {1448805784652746894, 1448806932575162422, 1451571863825154058, 1451800068641521846, 1457368711630426153, 1471222806200062196, 1495820309750616195}
+TICKET_CATEGORY_IDS = {1448805784652746894, 1448806932575162422, 1451571863825154058, 1451800068641521846, 1457368711630426153, 1471222806200062196, 1495820309750616195, 1506713487315964054, 1506713487315964054, 1512417173652639744, 1512420242801037343, 1512420314447876096}
 STAFF_ROLE_IDS = {1448719741756768308, 1449035039072452800, 1449035563570303017}
 AUTO_ROLE_IDS = {1448774516904825026}
 REMOVE_ROLE_IDS = {1448831320636784660, 1448774246447845518}
@@ -2040,14 +2176,13 @@ class MyBot(commands.Bot):
         vc_reward_task.start()
         check_birthday_roles.start()
         autokick_check.start()
+        aura_expiry_task.start()
         market_fluctuation.start()      
         daily_puzzle_scheduler.start()
         science_fact_dropper.start()
         reminder_checker.start()
         daily_hot_take.start()
         server_mood_tracker.start()
-        weekly_recap.start()
-        weekly_recap_task.start()
 
 bot = MyBot()
 last_chatter_id = None
@@ -2431,7 +2566,7 @@ async def on_message(m: discord.Message):
 
     global last_chatter_id
     text = m.content.lower().strip()
-    
+        
     _yo_triggers = {"yo", "yoo", "yooo", "hi", "hello", "wsg", "wassup", "konnichiwa", "konnichiha", "hola", "bonjour", "salut", "ciao", "hallo", "namaste", "salam", "merhaba", "oi", "ola", "hei", "hej", "привет", "안녕", "こんにちは"}
     _gm_triggers = {"gm", "good morning", "good mrng", "gmorning", "subah", "subh", "subha", "good mng"}
     _gn_triggers = {"gn", "good night", "good nite", "goodnight", "raat", "sone ja", "so ja", "sojaon"}
@@ -2519,6 +2654,19 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
             if reply:
                 await m.reply(reply)
                 asyncio.create_task(_extract_memory(m.author.id, m.author.display_name, question, reply))
+                # --- BOT STEALS THE PUZZLE REWARD ---
+                if active_puzzle["question"] and not active_puzzle["solved"]:
+                    ans = str(active_puzzle["answer"]).lower()
+                    # Strip punctuation from the bot's reply so we can check it cleanly
+                    clean_reply = "".join(c for c in reply.lower() if c.isalnum() or c.isspace())
+                    
+                    # Check if the exact answer is inside the bot's reply
+                    if f" {ans} " in f" {clean_reply} " or ans == clean_reply.replace(" ", ""):
+                        active_puzzle["solved"] = True
+                        bot_bank["balance"] += 50
+                        save_data()
+                        
+                        await m.channel.send(f"🤖 **Hold up... I just solved my own puzzle!**\nI'm stealing the **50 Aura** for my casino bank! 🤑\n> ✅ Answer: **{active_puzzle['answer'].title()}**")
         return
     if any(w in text for w in BAD_WORDS):
         try: 
@@ -2529,12 +2677,19 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
 
     if m.channel.id in (CHAT_CHANNEL_ID, CHAT_CHANNEL_ID_2):
         uid = m.author.id
+        
+        # This makes sure they ONLY stay alive if they talk in the main chat!
+        last_message_times[str(uid)] = time.time()
+        
         # Puzzle answer check
         if active_puzzle["question"] and not active_puzzle["solved"]:
-            user_ans = text.strip().lower()
-            correct_ans = active_puzzle["answer"].lower()
-            # Allow minor spacing differences for multi-word answers
-            if user_ans == correct_ans or user_ans.replace(" ", "") == correct_ans.replace(" ", ""):
+            correct_ans = str(active_puzzle["answer"]).lower()
+            
+            # Strip punctuation from the user's message so we can check it cleanly
+            clean_text = "".join(c for c in text.lower() if c.isalnum() or c.isspace())
+            
+            # Check if the exact answer is anywhere inside their sentence
+            if f" {correct_ans} " in f" {clean_text} " or correct_ans == clean_text.replace(" ", ""):
                 active_puzzle["solved"] = True
                 old_b = balance[uid]
                 balance[uid] += 50
@@ -2586,6 +2741,55 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
 
 # ================== BACKGROUND TASKS ==================
 VC_MILESTONES = [10, 50, 100, 250, 500, 1000]
+# ==========================================
+# INACTIVITY WIPER (THE GRIM REAPER)
+# ==========================================
+@tasks.loop(hours=24) # Check every 24 hours
+async def aura_expiry_task():
+    print("💀 Running 7-Day Inactivity Check...")
+    current_time = time.time()
+    seven_days_in_seconds = 7 * 24 * 60 * 60
+    
+    wiped_uids = []
+    aura_burned = 0
+    
+    for uid in list(balance.keys()):
+        if balance[uid] <= 0:
+            continue
+            
+        last_spoke = last_message_times.get(str(uid))
+        if last_spoke is None:
+            last_message_times[str(uid)] = current_time
+            continue
+            
+        if (current_time - last_spoke) >= seven_days_in_seconds:
+            aura_burned += balance[uid]
+            balance[uid] = 0
+            wiped_uids.append(uid)
+            print(f"🪦 User {uid} was wiped for 7 days of silence.")
+
+    save_data()
+    print(f"✅ Reaper complete. Wiped {len(wiped_uids)} accounts. Burned {aura_burned:,} Aura.")
+    
+    # --- PUBLIC ANNOUNCEMENT WITH PINGS ---
+    if wiped_uids:
+        channel = bot.get_channel(CHAT_CHANNEL_ID) 
+        if channel:
+            # Split the victims into groups of 40 so Discord doesn't block the message for being too long!
+            for i in range(0, len(wiped_uids), 40):
+                chunk = wiped_uids[i:i + 40]
+                
+                # This creates the raw text string that actually triggers the ping notification
+                ping_string = " ".join([f"<@{u}>" for u in chunk])
+                
+                embed = discord.Embed(
+                    title="💀 The Grim Reaper", 
+                    description=f"Swept **{len(chunk)}** inactive accounts for 7 days of silence.\nAll their Aura has been burned to ash. Say something in chat to stay alive!", 
+                    color=discord.Color.dark_theme()
+                )
+                
+                # Send the pings outside the embed, but attach the cool embed below it
+                await channel.send(content=ping_string, embed=embed)
 
 @tasks.loop(minutes=1)
 async def vc_reward_task():
@@ -2660,59 +2864,6 @@ async def server_mood_tracker():
     )
     if mood:
         await ch.send(f"📡 **Server Mood Check:** {mood}")
-
-@tasks.loop(hours=1)
-async def weekly_recap():
-    now = datetime.datetime.now(IST)
-    # Only run on Sunday at 9pm IST
-    if now.weekday() != 6 or now.hour != 21:
-        return
-    ch = bot.get_channel(CHAT_CHANNEL_ID)
-    if not ch:
-        return
-
-    # Top earner
-    top_uid = max(balance, key=lambda u: balance[u]) if balance else None
-    top_name = "unknown"
-    if top_uid:
-        m = ch.guild.get_member(top_uid) if ch.guild else None
-        top_name = m.display_name if m else f"<@{top_uid}>"
-
-    # Biggest stock mover
-    best_coin = max(stocks, key=lambda c: stocks[c]) if stocks else "unknown"
-    worst_coin = min(stocks, key=lambda c: stocks[c]) if stocks else "unknown"
-
-    # Top casino loser
-    top_loser_uid = max(casino_losses, key=lambda u: casino_losses[u]) if casino_losses else None
-    loser_name = "nobody"
-    if top_loser_uid:
-        m = ch.guild.get_member(top_loser_uid) if ch.guild else None
-        loser_name = m.display_name if m else f"<@{top_loser_uid}>"
-        loser_amt = casino_losses[top_loser_uid]
-    else:
-        loser_amt = 0
-
-    recap = await quick_ai(
-        f"Write a fun weekly server recap for a Discord economy server. "
-        f"Top earner: {top_name} with {balance.get(top_uid, 0):,} Aura. "
-        f"Hottest stock: {best_coin} at {stocks.get(best_coin, 0):.1f} Aura. "
-        f"Worst stock: {worst_coin} at {stocks.get(worst_coin, 0):.1f} Aura. "
-        f"Biggest casino loser: {loser_name} lost {loser_amt:,} Aura. "
-        f"Be funny, hype, and sarcastic. Max 4 sentences.",
-        max_tokens=200
-    )
-    if recap:
-        embed = discord.Embed(
-            title="📊 Weekly Server Recap",
-            description=recap,
-            color=discord.Color.blurple()
-        )
-        embed.set_footer(text="See you next week! Keep earning 💪")
-        await ch.send(embed=embed)
-    # Reset weekly casino tracking
-    casino_losses.clear()
-    casino_wins.clear()
-    save_data()
 
 
 @tasks.loop(minutes=5)
@@ -2941,72 +3092,74 @@ async def daily_hot_take():
         embed.set_footer(text="This is not financial advice. Or is it? 👀")
         await ch.send(embed=embed)
 
-
-@tasks.loop(time=datetime.time(hour=20, minute=0, tzinfo=IST))  # 8pm IST every day
+# ==========================================
+# WEEKLY RECAP ENGINE
+# ==========================================
+@tasks.loop(time=datetime.time(hour=20, minute=0, tzinfo=IST))  # Runs at 8:00 PM IST exactly
 async def weekly_recap_task():
     now = datetime.datetime.now(IST)
-    if now.weekday() != 6:  # Only on Sunday
+    if now.weekday() != 6:  # 6 = Sunday. If it's not Sunday, go back to sleep.
         return
+        
     ch = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
     if not ch:
         return
 
-    # Top earner
+    # 1. Calculate Top Earner
     top_earner_id = max(weekly_aura_earned, key=weekly_aura_earned.get) if weekly_aura_earned else None
-    top_earner_name = ""
+    top_earner_name = "Nobody"
     if top_earner_id:
-        for g in bot.guilds:
-            m = g.get_member(top_earner_id)
-            if m:
-                top_earner_name = m.display_name
-                break
-        top_earner_name = top_earner_name or f"<@{top_earner_id}>"
+        m = ch.guild.get_member(top_earner_id) if ch.guild else None
+        top_earner_name = m.display_name if m else f"<@{top_earner_id}>"
 
-    # Biggest casino loser
+    # 2. Calculate Biggest Loser
     top_loser_id = max(weekly_casino_lost, key=weekly_casino_lost.get) if weekly_casino_lost else None
-    top_loser_name = ""
+    top_loser_name = "Nobody"
     if top_loser_id:
-        for g in bot.guilds:
-            m = g.get_member(top_loser_id)
-            if m:
-                top_loser_name = m.display_name
-                break
-        top_loser_name = top_loser_name or f"<@{top_loser_id}>"
+        m = ch.guild.get_member(top_loser_id) if ch.guild else None
+        top_loser_name = m.display_name if m else f"<@{top_loser_id}>"
 
-    # Biggest stock move
-    best_stock = max(stocks, key=stocks.get)
-    worst_stock = min(stocks, key=stocks.get)
+    # 3. Calculate Market Moves
+    best_stock = max(stocks, key=stocks.get) if stocks else "None"
+    worst_stock = min(stocks, key=stocks.get) if stocks else "None"
 
+    # 4. Generate the AI Hype Message
     prompt = (
         f"Write a fun weekly server recap for a Discord economy server. "
         f"Top Aura earner this week: {top_earner_name} with {weekly_aura_earned.get(top_earner_id, 0):,} Aura. "
         f"Biggest casino loser: {top_loser_name} lost {weekly_casino_lost.get(top_loser_id, 0):,} Aura. "
-        f"Highest priced stock: {best_stock} at {stocks[best_stock]:.1f} Aura. "
-        f"Lowest priced stock: {worst_stock} at {stocks[worst_stock]:.1f} Aura. "
+        f"Highest priced stock: {best_stock} at {stocks.get(best_stock, 0):.1f} Aura. "
+        f"Lowest priced stock: {worst_stock} at {stocks.get(worst_stock, 0):.1f} Aura. "
         f"Be funny, engaging, like a sports commentator. 3-4 sentences max."
     )
     recap = await quick_ai(prompt, max_tokens=600)
 
+    # 5. Build and Send the Embed
     embed = discord.Embed(
         title="📊 Weekly Server Recap",
         description=recap or "Another week in the books! Check the leaderboard to see where you stand.",
         color=discord.Color.blurple()
     )
-    if top_earner_id:
-        embed.add_field(name="💰 Top Earner", value=f"{top_earner_name} — +{weekly_aura_earned.get(top_earner_id,0):,} Aura", inline=True)
-    if top_loser_id:
-        embed.add_field(name="🎰 Biggest Gambler", value=f"{top_loser_name} — lost {weekly_casino_lost.get(top_loser_id,0):,} Aura", inline=True)
-    embed.add_field(name="📈 Hot Stock", value=f"{best_stock} @ {stocks[best_stock]:.1f}", inline=True)
-    embed.add_field(name="📉 Cold Stock", value=f"{worst_stock} @ {stocks[worst_stock]:.1f}", inline=True)
+    
+    if top_earner_id and weekly_aura_earned.get(top_earner_id, 0) > 0:
+        embed.add_field(name="💰 Top Earner", value=f"{top_earner_name} \n(+{weekly_aura_earned[top_earner_id]:,} Aura)", inline=True)
+    if top_loser_id and weekly_casino_lost.get(top_loser_id, 0) > 0:
+        embed.add_field(name="🎰 Biggest Gambler", value=f"{top_loser_name} \n(-{weekly_casino_lost[top_loser_id]:,} Aura)", inline=True)
+        
+    if stocks:
+        embed.add_field(name="📈 Hot Stock", value=f"{best_stock} @ {stocks.get(best_stock, 0):.1f}", inline=True)
+        embed.add_field(name="📉 Cold Stock", value=f"{worst_stock} @ {stocks.get(worst_stock, 0):.1f}", inline=True)
+        
     embed.set_footer(text="See you next week! Keep grinding 💪")
-
     await ch.send(embed=embed)
 
-    # Reset weekly stats
+    # 6. WIPE WEEKLY MEMORY FOR THE NEW WEEK
     weekly_aura_earned.clear()
     weekly_casino_lost.clear()
-
-
+    casino_losses.clear()
+    casino_wins.clear()
+    save_data()
+    
 @tasks.loop(seconds=15)
 async def reminder_checker():
     global pending_reminders
@@ -3866,6 +4019,9 @@ async def gamble(i: discord.Interaction, amount: int, side: str):
             discord.Color.red()
         ))
 
+# ==========================================
+# LEADERBOARD COMMAND
+# ==========================================
 @bot.tree.command(name="leaderboard", description="View the Server Leaderboard")
 @app_commands.choices(category=[
     app_commands.Choice(name="Invites", value="invites"),
@@ -3888,7 +4044,7 @@ async def leaderboard(i: discord.Interaction, category: str):
         elif category == "bal":
             source = balance
             label = "Richest Members"
-            emoji = E_COIN
+            emoji = E_COIN # Assuming E_COIN is defined elsewhere in your file
         else:
             source = {}
             for uid, holding in portfolios.items():
@@ -3905,34 +4061,24 @@ async def leaderboard(i: discord.Interaction, category: str):
             label = "Top Investors"
             emoji = "📈"
         
-        sorted_data = sorted(source.items(), key=lambda x: int(x[1]), reverse=True)[:10]
+        # We removed the [:10] here so we grab EVERY single user in the database
+        sorted_data = sorted(source.items(), key=lambda x: int(x[1]), reverse=True)
         
         if not sorted_data:
-            return await i.response.send_message(embed=discord.Embed(title=f"🏆 Top 10 | {label}", description="No data available yet.", color=discord.Color.gold()))
+            return await i.response.send_message(embed=discord.Embed(title=f"🏆 Server Leaderboard | {label}", description="No data available yet.", color=discord.Color.gold()))
 
-        desc = ""
-        for idx, (u, v) in enumerate(sorted_data):
-            if idx == 0: 
-                rank = "🥇"
-            elif idx == 1: 
-                rank = "🥈"
-            elif idx == 2: 
-                rank = "🥉"
-            else: 
-                rank = f"` #{idx+1} `" 
-
-            member = i.guild.get_member(int(u)) if i.guild else None
-            name = member.display_name if member else f"<@{u}>"
-            desc += f"{rank} {name} — **{int(v):,}** {emoji}\n\n"
-
-        embed = discord.Embed(title=f"🏆 Server Leaderboard | {label}", description=desc, color=discord.Color.gold())
+        # Pass the massive list into our engine to handle the pages automatically
+        view = LeaderboardView(
+            data_list=sorted_data, 
+            guild=i.guild, 
+            label=label, 
+            emoji=emoji, 
+            user=i.user
+        )
         
-        if i.guild and i.guild.icon: 
-            embed.set_thumbnail(url=i.guild.icon.url)
-            
-        embed.set_footer(text=f"Requested by {i.user.display_name}", icon_url=i.user.display_avatar.url)
+        # Send the very first page (0-10) with the buttons attached
+        await i.response.send_message(embed=view.generate_embed(), view=view)
         
-        await i.response.send_message(embed=embed)
     except Exception as e:
         await i.response.send_message(f"Leaderboard Error: {e}", ephemeral=True)
 
@@ -5053,104 +5199,240 @@ async def add_role_to_tickets(i: discord.Interaction, role: discord.Role):
                 
     await i.followup.send(f"✅ Successfully granted {role.mention} access to **{updated_count}** ticket channels.", ephemeral=True)
     
+# --- GLOBAL LOCK VARIABLE ---
+# Place this at the top of your file with your other configuration variables
+is_verifying_locked = False
+
 # ==========================================
-# VERIFY SHEET COMMAND (V3)
+# VERIFY SHEET COMMAND
 # ==========================================
-@bot.tree.command(name="verify_sheet", description="Staff: Grade a task sheet and push to Master Pay Sheet")
+@bot.tree.command(name="verify_sheet", description="Grade your task sheet and push to the Master Pay Sheet")
+@app_commands.describe(sheet_url="Link to the Google Sheet")
 async def verify_sheet(i: discord.Interaction, sheet_url: str):
-    # Adjust role check if necessary
-    if not i.user.guild_permissions.manage_messages: 
-        return await i.response.send_message("Staff only.", ephemeral=True)
+    global is_verifying_locked
+    
+    # 0. Check Concurrency Lock
+    if is_verifying_locked:
+        return await i.response.send_message(
+            "⏳ **Hold up!** Someone else is currently verifying a sheet. Please wait for them to finish, then try again.", 
+            ephemeral=True
+        )
         
+    is_verifying_locked = True
     await i.response.defer()
     
-    if gc is None:
-        return await i.followup.send("❌ Google Sheets API is disconnected.")
-
+    MASTER_SHEET_URL = "https://docs.google.com/spreadsheets/d/16LsJL4-1Rv8gWbmjpS7GkC9HOmD1JAvLBYcWnGRkpHM/edit"
+    
     try:
+        reddit_token = await get_reddit_token()
+        if not reddit_token:
+            return await i.followup.send("❌ Failed to authenticate with Reddit API.")
+
+        if gc is None:
+            return await i.followup.send("❌ Google Sheets API is disconnected.")
+
         user_sheet = gc.open_by_url(sheet_url).sheet1
-        discord_name = user_sheet.acell('B2').value or str(i.user.name)
+        
+        # --- ANTI-SPAM STAMP CHECK ---
+        stamp = user_sheet.acell('A1').value
+        if "VERIFIED" in str(stamp).upper():
+            is_verifying_locked = False 
+            return await i.followup.send("❌ **Already Verified!** This sheet has already been processed.")
+
+        # --- MANDATORY NAME CHECK (Moved to top so it fails fast) ---
+        target_name_raw = user_sheet.acell('B2').value
+        if not target_name_raw or str(target_name_raw).strip() == "":
+            is_verifying_locked = False
+            return await i.followup.send("❌ **Error:** Cell B2 in the user's sheet is empty. Please enter the member's name.")
+        
+        target_name = str(target_name_raw).strip()
+
         payment_address = user_sheet.acell('B3').value or "NO ADDRESS PROVIDED"
         profile_link = user_sheet.acell('C5').value or ""
         
-        rows = user_sheet.get_all_values()
-        stats = {"active": 0, "mod_removed": 0, "filtered": 0, "invalid": 0}
+        display_rows = user_sheet.get_all_values()
+        try:
+            formula_rows = user_sheet.get("A1:Z200", value_render_option='FORMULA')
+        except:
+            formula_rows = []
+
+        # 1.5 INITIALIZE LISTS OUTSIDE THE LOOP (Fixes the "None" embed issue)
+        stats = {"active": 0, "mod_removed": 0, "filtered": 0, "failed": 0}
+        mod_rows, filtered_rows, failed_rows = [], [], []
         updates = [] 
         
-        # --- PHASE 1: LOCATE THE TOTAL EARNINGS CELL ---
         total_row_idx = None
         total_col_idx = None
         
-        for r_idx, r in enumerate(rows[:20]): 
+        # 1. Find the "Total Earnings" row dynamically
+        for r_idx, r in enumerate(display_rows[:25]): 
             row_text = [str(cell).lower().strip() for cell in r]
             if "total earnings:" in row_text or "total earnings" in row_text:
                 for c_idx, cell in reversed(list(enumerate(r))):
                     if str(cell).strip() != "" and "total" not in str(cell).lower() and str(cell) != "FALSE":
-                        total_row_idx = r_idx + 1 # Gspread uses 1-based indexing
+                        total_row_idx = r_idx + 1 
                         total_col_idx = c_idx + 1
                         break
 
-        # --- BULLETPROOF LINK FINDER ---
-        # Dynamically scan below the Total Earnings row so we don't accidentally grade their profile link
-        start_row = total_row_idx if total_row_idx else 11
-        
-        for row_idx in range(start_row, len(rows)):
-            row = rows[row_idx]
-            url = None
+        # 2. Loop through all rows to find and verify Reddit/Image links
+        for row_idx, row in enumerate(display_rows):
+            sheet_row = row_idx + 1
             
-            for c_idx in range(len(row)):
-                cell_str = str(row[c_idx]).lower()
-                if "reddit.com" in cell_str or "redd.it" in cell_str:
-                    url = str(row[c_idx])
-                    break 
+            # Skip everything above and including the Total Earnings row
+            if total_row_idx and sheet_row <= total_row_idx + 1:
+                continue
+                
+            # --- THE RESET --- 
+            # Clear G (Filtered) and H (Mod Removed) by setting them to False (Unchecked)
+            updates.append({'range': f'G{sheet_row}:H{sheet_row}', 'values': [[False, False]]})
+                
+            url = None
+            col_found_in = -1
+            
+            for c_idx, cell in enumerate(row):
+                # STRICT FILTER: We ONLY care about Column C (index 2) and Column D (index 3)
+                if c_idx not in [2, 3]:
+                    continue
+                    
+                display_val = str(cell).strip()
+                text_to_check = display_val
+                
+                if len(formula_rows) > row_idx and len(formula_rows[row_idx]) > c_idx:
+                    formula_val = str(formula_rows[row_idx][c_idx]).strip()
+                    if "hyperlink" in formula_val.lower():
+                        text_to_check = formula_val
+
+                if "http" in text_to_check.lower() or "reddit" in text_to_check.lower():
+                    url_match = re.search(r'(https?://[^\s"]+)', text_to_check)
+                    if url_match:
+                        url = url_match.group(1)
+                        col_found_in = c_idx
+                        break # Found a link in either C or D, stop scanning this row
             
             if url:
-                status = check_reddit_post(url)
-                sheet_row = row_idx + 1 
-                
-                if status == "active":
-                    stats["active"] += 1
-                elif status == "mod_removed":
-                    stats["mod_removed"] += 1
-                    updates.append({'range': f'H{sheet_row}', 'values': [[True]]})
-                elif status in ["filtered", "deleted"]:
-                    stats["filtered"] += 1
-                    updates.append({'range': f'G{sheet_row}', 'values': [[True]]})
-                else:
-                    stats["invalid"] += 1
+                # Ignore Reddit user profile links completely
+                if "/user/" in url.lower() or "/u/" in url.lower():
+                    continue
 
-        # Apply the penalty checkboxes to the sheet
+                # --- NEW COLUMN-BASED LOGIC ---
+                # 1. If the link was found in Column D, it's ALWAYS a screenshot/proof!
+                if col_found_in == 3:
+                    status = "Screenshot"
+                # 2. If it's a Reddit link in Column C, grade it!
+                elif "reddit.com" in url.lower() or "redd.it" in url.lower():
+                    status = await verify_reddit_post(url, reddit_token)
+                # 3. Anything else in Column C is an invalid task link
+                else:
+                    status = "Invalid Link"
+                
+                # Apply Status Logic, Colors, Checkboxes, and Collect Rows
+                if status == "Active": 
+                    stats["active"] += 1
+                elif status == "Mod Removed":
+                    stats["mod_removed"] += 1
+                    mod_rows.append(str(sheet_row))
+                    updates.append({'range': f'H{sheet_row}', 'values': [[True]]}) # TICK MOD REMOVED
+                    user_sheet.format(f'A{sheet_row}:H{sheet_row}', {'backgroundColor': {'red': 1.0, 'green': 0.6, 'blue': 0.0}})
+                elif status in ["Filtered", "Deleted"]:
+                    stats["filtered"] += 1
+                    filtered_rows.append(str(sheet_row))
+                    updates.append({'range': f'G{sheet_row}', 'values': [[True]]}) # TICK FILTERED
+                    user_sheet.format(f'A{sheet_row}:H{sheet_row}', {'backgroundColor': {'red': 1.0, 'green': 0.0, 'blue': 0.0}})
+                elif status == "Invalid Link":
+                    stats["failed"] += 1
+                    failed_rows.append(str(sheet_row))
+                    updates.append({'range': f'G{sheet_row}', 'values': [[True]]}) # TICK FILTERED (Penalty)
+                    user_sheet.format(f'A{sheet_row}:H{sheet_row}', {'backgroundColor': {'red': 1.0, 'green': 1.0, 'blue': 0.0}})
+                elif status == "Screenshot":
+                    # Paint Column D links light blue for manual review
+                    user_sheet.format(f'A{sheet_row}:H{sheet_row}', {'backgroundColor': {'red': 0.8, 'green': 0.9, 'blue': 1.0}})
+                else:
+                    stats["failed"] += 1 
+                    
+                await asyncio.sleep(1.2)
+
         if updates:
             user_sheet.batch_update(updates)
             
-        # --- PHASE 2: RE-FETCH UPDATED MATH ---
-        # Give Google Sheets 4 seconds to apply deductions based on the checked boxes
-        await asyncio.sleep(4.0) 
+        await asyncio.sleep(2.0) 
         
-        final_amount = "$0.00"
+        # 3. Calculate Payout (Clean Number for SUM function)
+        final_amount_str = "0,00"
         if total_row_idx and total_col_idx:
-            # Pull exactly that one cell again to get the final post-deduction number
-            updated_cell = user_sheet.cell(total_row_idx, total_col_idx)
-            final_amount = str(updated_cell.value)
+            raw_val = str(user_sheet.cell(total_row_idx, total_col_idx).value)
+            # Remove $ and spaces, convert dot to comma
+            final_amount_str = raw_val.replace('$', '').replace(' ', '').replace('.', ',')
+
+        # 4. Update Master Sheet 
+        master_sheet = gc.open_by_url(MASTER_SHEET_URL).get_worksheet(0)
+        all_master_rows = master_sheet.get_all_values()
         
-        # Push to Master Sheet
-        MASTER_SHEET_URL = "https://docs.google.com/spreadsheets/d/16LsJL4-1Rv8gWbmjpS7GkC9HOmD1JAvLBYcWnGRkpHM/edit"
-        master_doc = gc.open_by_url(MASTER_SHEET_URL)
-        master_sheet = master_doc.get_worksheet(0) 
+        row_to_update = -1
+        empty_row_idx = -1
         
-        master_sheet.append_row(["FALSE", discord_name, final_amount, payment_address, "", profile_link])
+        for idx, row in enumerate(all_master_rows):
+            # Ensure row has enough columns
+            while len(row) < 6: row.append("")
+                
+            # Compare against the name found in the sheet
+            if row[1].strip().lower() == target_name.lower():
+                row_to_update = idx + 1
+                break
+                
+            if row[1].strip() == "" and empty_row_idx == -1 and idx > 0:
+                empty_row_idx = idx + 1
         
+        if row_to_update != -1:
+            master_sheet.update(range_name=f'C{row_to_update}', values=[[final_amount_str]], value_input_option='USER_ENTERED')
+            master_sheet.update(range_name=f'F{row_to_update}', values=[[profile_link]], value_input_option='USER_ENTERED')
+        else:
+            # Use the target_name taken from the sheet
+            new_row_data = ["FALSE", target_name, final_amount_str, payment_address, "", profile_link]
+            if empty_row_idx != -1:
+                master_sheet.update(range_name=f'A{empty_row_idx}:F{empty_row_idx}', values=[new_row_data], value_input_option='USER_ENTERED')
+            else:
+                master_sheet.append_row(new_row_data, value_input_option='USER_ENTERED')
+                
+        # --- STAMP THE SHEET AS COMPLETED (Fixed for IST) ---
+        from datetime import datetime, timezone, timedelta
+        
+        # Create IST timezone object (UTC+5:30)
+        ist = timezone(timedelta(hours=5, minutes=30))
+        ist_time = datetime.now(ist).strftime('%Y-%m-%d %H:%M')
+        
+        try:
+            user_sheet.update(range_name='A1', values=[[f"VERIFIED - {ist_time}"]], value_input_option='USER_ENTERED')
+        except:
+            pass
+        
+        # 5. Final Embed
         embed = discord.Embed(title="🧾 Task Sheet Graded & Logged", color=0x00FF00)
-        embed.description = f"Successfully graded tasks for **{discord_name}** and logged them to the Master Sheet."
+        embed.description = f"Graded for **{target_name}**."
+        
         embed.add_field(name="✅ Active", value=str(stats['active']), inline=True)
-        embed.add_field(name="⚠️ Mod Removed (50%)", value=str(stats['mod_removed']), inline=True)
-        embed.add_field(name="❌ Filtered/Deleted", value=str(stats['filtered']), inline=True)
-        embed.add_field(name="💰 Final Payout Logged", value=f"**{final_amount}**", inline=False)
         
+        # Display Mod Removed rows
+        mod_val = f"{stats['mod_removed']} (Rows: {', '.join(mod_rows)})" if mod_rows else "0"
+        embed.add_field(name="⚠️ Mod Removed", value=mod_val, inline=False)
+        
+        # Display Filtered rows
+        filt_val = f"{stats['filtered']} (Rows: {', '.join(filtered_rows)})" if filtered_rows else "0"
+        embed.add_field(name="❌ Filtered", value=filt_val, inline=False)
+        
+        if stats['failed'] > 0:
+            embed.add_field(name="🚨 Invalid Links", value=f"**{stats['failed']}** (Rows: {', '.join(failed_rows)})", inline=False)
+            
+        embed.add_field(name="📸 Upvotes/Screenshots", value="Highlighted **LIGHT BLUE** for manual review.", inline=False)
+        embed.add_field(name="💰 Final Payout", value=f"**{final_amount_str}**", inline=False)
         await i.followup.send(embed=embed)
-        
+
     except Exception as e:
-        await i.followup.send(f"❌ Failed to verify sheet. Error: `{e}`") 
+        print(f"CRITICAL ERROR: {e}")
+        await i.followup.send(f"❌ **Fatal error.** Check console: \n`{e}`")
+    
+    finally:
+        is_verifying_locked = False
+        
 # ==========================================
 # REMINDER COMMANDS
 # ==========================================
@@ -5196,4 +5478,150 @@ async def cancel_reminder(i: discord.Interaction, reminder_id: str):
         if not active:
             active = "There are no active reminders in this channel."
         await i.response.send_message(f"❌ Reminder ID not found. Active reminders here:\n{active}", ephemeral=True)
+        
+# --- SMMWIZ CONFIGURATION ---
+SMMWIZ_API_KEY = os.getenv("SMMWIZ_API_KEY")
+SMMWIZ_URL = "https://smmwiz.com/api/v2"
+ADMIN_ROLE_ID = 1448719741756768308  # Strictly enforced admin role
+
+@bot.tree.command(
+    name="buy_upvotes", 
+    description="Admin Only: Deploy a real-money Reddit upvote campaign via Smmwiz"
+)
+@app_commands.describe(
+    post_url="Link to the Reddit post", 
+    batch_size="How many upvotes to send in each batch (Minimum is 10)",
+    runs="How many batches to send total",
+    interval_mins="Minutes to wait between each batch deployment"
+)
+async def buy_upvotes(
+    i: discord.Interaction, 
+    post_url: str, 
+    batch_size: int, 
+    runs: int, 
+    interval_mins: int
+):
+    # 1. Strict Admin Role Verification
+    has_role = any(role.id == ADMIN_ROLE_ID for role in i.user.roles)
+    if not has_role:
+        return await i.response.send_message(
+            "❌ **Access Denied:** This command is strictly restricted to authorized administrators.", 
+            ephemeral=True
+        )
+
+    # 2. Configuration & Real Money Cost Tracking
+    SERVICE_ID = 4749  
+    PRICE_PER_1000 = 31.36  # The actual Smmwiz wholesale rate for this service
+    
+    total_upvotes = batch_size * runs
+    # Calculate real dollar amount spent from your Smmwiz panel account
+    real_usd_cost = (total_upvotes / 1000) * PRICE_PER_1000
+
+    if batch_size < 10:
+        return await i.response.send_message(
+            "❌ **Order Rejected:** Smmwiz requires a minimum `batch_size` of 10 upvotes per batch.", 
+            ephemeral=True
+        )
+
+    # Defer to allow external API response time
+    await i.response.defer(ephemeral=False)
+
+    # 3. Build the Smmwiz API Payload
+    payload = {
+        "key": SMMWIZ_API_KEY,
+        "action": "add",
+        "service": SERVICE_ID,
+        "link": post_url,
+        "quantity": batch_size,   
+        "runs": runs,             
+        "interval": interval_mins 
+    }
+
+    try:
+        # 4. Dispatch the Real Money Order
+        async with aiohttp.ClientSession() as session:
+            async with session.post(SMMWIZ_URL, data=payload) as resp:
+                if resp.status != 200:
+                    return await i.followup.send(f"❌ **API Error Code {resp.status}:** Could not connect to Smmwiz backend.")
+                
+                data = await resp.json()
+
+        # 5. Process Output
+        if "order" in data:
+            order_id = data["order"]
+
+            # Create an agency-style tracking embed
+            embed = discord.Embed(
+                title="⚡ Campaign Deployed Successfully",
+                description=f"The backend order has been routed directly to your Smmwiz wholesale pool.",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Target Post", value=f"[Open Link]({post_url})", inline=False)
+            embed.add_field(name="Total Target", value=f"📈 **{total_upvotes:,}** Upvotes", inline=True)
+            embed.add_field(name="Pacing Strategy", value=f"⏳ {runs} batches of {batch_size}\nEvery {interval_mins} mins", inline=True)
+            embed.add_field(name="Order ID", value=f"`{order_id}`", inline=False)
+            # Shows exactly how much of your actual cash was spent on this run
+            embed.add_field(name="Real Cost Deducted", value=f"💵 **${real_usd_cost:.4f} USD**", inline=True)
+            embed.set_footer(text=f"Executed by Admin: {i.user.display_name}")
+            
+            await i.followup.send(embed=embed)
+            
+        else:
+            error_msg = data.get("error", "Unknown SMM Platform Error")
+            await i.followup.send(f"❌ **Panel API Error:** `{error_msg}`")
+
+    except Exception as e:
+        await i.followup.send(f"❌ **Network Exception:** Connection failed. `{e}`")
+        
+@bot.tree.command(name="delete_inactive_tickets", description="Delete tickets based on time since last message")
+@app_commands.describe(
+    category="The category to scan",
+    days="Days since last message (Default: 14)",
+    hours="Hours since last message (Default: 0)",
+    minutes="Minutes since last message (Default: 0)"
+)
+@app_commands.default_permissions(manage_channels=True)
+async def delete_inactive_tickets(
+    i: discord.Interaction, 
+    category: discord.CategoryChannel, 
+    days: int = 14, 
+    hours: int = 0, 
+    minutes: int = 0
+):
+    await i.response.defer(ephemeral=True)
+    
+    # Calculate cutoff based on user input
+    cutoff_date = discord.utils.utcnow() - timedelta(days=days, hours=hours, minutes=minutes)
+    
+    # Create a descriptive string for the log
+    time_desc = f"{days}d {hours}h {minutes}m"
+        
+    deleted_count = 0
+    kept_count = 0
+    
+    for channel in category.text_channels:
+        try:
+            # Check the latest message
+            messages = [msg async for msg in channel.history(limit=1)]
+            
+            # Logic: If empty, use creation date. If messages exist, use last message date.
+            last_activity = messages[0].created_at if messages else channel.created_at
+            
+            if last_activity <= cutoff_date:
+                await channel.delete(reason=f"Cleanup: Inactive for {time_desc}")
+                deleted_count += 1
+            else:
+                kept_count += 1
+                
+        except Exception as e:
+            print(f"Skipped {channel.name}: {e}")
+            kept_count += 1
+            
+    embed = discord.Embed(title="🗑️ Ticket Cleanup Complete", color=0xFF0000)
+    embed.add_field(name="Category", value=category.name, inline=True)
+    embed.add_field(name="Threshold", value=time_desc, inline=True)
+    embed.add_field(name="Results", value=f"Deleted: {deleted_count} | Kept: {kept_count}", inline=False)
+    
+    await i.followup.send(embed=embed)
+
 bot.run(TOKEN)
