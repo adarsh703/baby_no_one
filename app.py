@@ -9,6 +9,8 @@ import aiohttp
 import random
 import time
 import datetime
+import math
+from datetime import timedelta
 from dotenv import load_dotenv
 from collections import defaultdict, deque
 from typing import Optional
@@ -23,8 +25,11 @@ import urllib.parse
 
 
 
-load_dotenv()
+load_dotenv(dotenv_path="env")    # local dev file named 'env'
+load_dotenv(dotenv_path=".env")   # server/hosting panel file named '.env'
+load_dotenv()                     # fallback: auto-detect
 # ==========================================
+
 # INTERACTIVE LEADERBOARD PAGINATOR
 # ==========================================
 class LeaderboardView(discord.ui.View):
@@ -167,16 +172,6 @@ REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 USER_AGENT = "linux:MyDiscordBot:v1.0 (by /u/Dizzy_Sensee)"
 
-async def get_reddit_token():
-    auth = aiohttp.BasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
-    data = {'grant_type': 'client_credentials'}
-    headers = {'User-Agent': USER_AGENT}
-    async with aiohttp.ClientSession() as session:
-        async with session.post('https://www.reddit.com/api/v1/access_token', auth=auth, data=data, headers=headers) as resp:
-            if resp.status == 200:
-                token_data = await resp.json()
-                return token_data.get('access_token')
-            return None
 from bs4 import BeautifulSoup 
 
 async def get_reddit_token():
@@ -191,10 +186,9 @@ async def get_reddit_token():
             return None
 
 async def verify_reddit_post(url: str, token: str):
-    # --- The Disguise: Put this on immediately for mobile links ---
     headers = {
         'Authorization': f'Bearer {token}', 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': USER_AGENT
     }
 
     # 1. Handle redirects for /s/ mobile links and resolve the actual URL
@@ -281,10 +275,202 @@ async def verify_reddit_post(url: str, token: str):
         return "Failed"
 
 
+async def get_reddit_user_info(username: str, token: str) -> dict | None:
+    """Fetch Reddit account age (days) and total karma for a given username."""
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'User-Agent': USER_AGENT
+    }
+    api_url = f"https://oauth.reddit.com/user/{username}/about"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 404:
+                    return None  # User doesn't exist
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                user_data = data.get('data', {})
+                created_utc = user_data.get('created_utc', 0)
+                link_karma = user_data.get('link_karma', 0)
+                comment_karma = user_data.get('comment_karma', 0)
+                total_karma = link_karma + comment_karma
+                account_age_days = (time.time() - created_utc) / 86400 if created_utc else 0
+                is_suspended = user_data.get('is_suspended', False)
+                return {
+                    "username": user_data.get('name', username),
+                    "karma": total_karma,
+                    "link_karma": link_karma,
+                    "comment_karma": comment_karma,
+                    "age_days": account_age_days,
+                    "suspended": is_suspended
+                }
+    except Exception as e:
+        print(f"DEBUG Reddit user info error: {e}")
+        return None
 
-   
-    
+async def fetch_cqs_score(cqs_url: str, token: str = None) -> float | None:
+    """
+    Reads a Reddit post/comment URL from r/WhatIsMyCQS (or similar) where
+    AutoMod replied with the user's CQS tier. Extracts the tier word and maps it
+    to a numeric value: Highest=100, High=75, Moderate=50, Low=25, Lowest=10.
+
+    Returns a float or None if the tier can't be determined.
+    """
+    CQS_TIERS = {
+        "highest": 100.0,
+        "high":     75.0,
+        "moderate": 50.0,
+        "low":      25.0,
+        "lowest":   10.0,
+    }
+
+    # If no token given, get one now
+    if not token:
+        token = await get_reddit_token()
+    if not token:
+        return None
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'User-Agent': USER_AGENT
+    }
+
+    # ── Resolve the URL to get the post/comment ID ──
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(cqs_url, headers=headers, allow_redirects=True,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                final_url = str(resp.url)
+    except Exception as e:
+        print(f"DEBUG CQS URL resolve error: {e}")
+        return None
+
+    if "comments/" not in final_url:
+        return None
+
+    # ── Extract post ID ──
+    try:
+        post_id = final_url.split("/comments/")[1].split("/")[0].split("?")[0]
+    except Exception:
+        return None
+
+    # ── Fetch all comments on the post via Reddit JSON API ──
+    json_url = f"https://oauth.reddit.com/comments/{post_id}?limit=50&depth=5"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(json_url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        print(f"DEBUG CQS fetch error: {e}")
+        return None
+
+    # ── Extract tier from a single comment body ──
+    def extract_tier_from_text(body: str):
+        """
+        Extracts CQS tier from AutoMod reply text.
+        AutoMod format: "Your current CQS is HIGH."
+        Returns the numeric value for the tier, or None.
+        """
+        if not body:
+            return None
+
+        TIER_NAMES = list(CQS_TIERS.keys())  # highest, high, moderate, low, lowest
+
+        # Pass 1 — exact AutoMod phrase: "Your current CQS is **HIGH**."
+        match = re.search(
+            r'your\s+current\s+CQS\s+is\s+[*_]*(\w+)',
+            body, re.IGNORECASE
+        )
+        if match:
+            word = match.group(1).lower()
+            if word in CQS_TIERS:
+                return CQS_TIERS[word]
+
+        # Pass 2 — broader CQS context: "CQS is HIGH" / "CQS: Moderate"
+        match = re.search(
+            r'CQS\s*(?:is|:)\s*[*_]*(\w+)',
+            body, re.IGNORECASE
+        )
+        if match:
+            word = match.group(1).lower()
+            if word in CQS_TIERS:
+                return CQS_TIERS[word]
+
+        # Pass 3 — last resort: standalone tier word on its own line
+        for line in body.splitlines():
+            line = line.strip().rstrip('.').lower()
+            if line in TIER_NAMES:
+                return CQS_TIERS[line]
+
+        return None
+
+
+    # ── Walk all comments looking for a bot reply with a tier ──
+    def walk_comments(listing):
+        if not isinstance(listing, dict):
+            return None
+        children = listing.get("data", {}).get("children", [])
+        for child in children:
+            body = child.get("data", {}).get("body", "")
+            result = extract_tier_from_text(body)
+            if result is not None:
+                return result
+            # Recurse into replies
+            replies = child.get("data", {}).get("replies", {})
+            result = walk_comments(replies)
+            if result is not None:
+                return result
+        return None
+
+    # data is a list: [post_listing, comments_listing]
+    if isinstance(data, list) and len(data) >= 2:
+        score = walk_comments(data[1])
+        if score is not None:
+            return score
+
+    # Also check post selftext as a last resort
+    try:
+        selftext = data[0]["data"]["children"][0]["data"].get("selftext", "")
+        result = extract_tier_from_text(selftext)
+        if result is not None:
+            return result
+    except Exception:
+        pass
+
+    return None
+
+
+def extract_reddit_username_from_url(url: str) -> str | None:
+    """Extract Reddit username from a profile URL like https://reddit.com/user/username"""
+    url = url.strip().rstrip('/')
+    patterns = [
+        r'reddit\.com/u(?:ser)?/([A-Za-z0-9_-]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+def classify_cqs(score: float | None) -> str:
+    """Map a numeric CQS score to a category label."""
+    if score is None:
+        return "unknown"
+    if score >= 90:
+        return "highest"   # Highest CQS
+    elif score >= 70:
+        return "high"      # High CQS
+    elif score >= 50:
+        return "moderate"  # Mod CQS
+    else:
+        return "low"       # Low CQS
+
 # ================== ENV & LOGGING ==================
+
 
 # Use your Project ID from the screenshot
 vertex_client = genai.Client(
@@ -299,17 +485,20 @@ CRICKET_API_KEY = os.getenv("CRICKET_API", "")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-AI_SYSTEM = r"""You are baby_no_one, the bot of this Discord server. Smart, bully, chill, a bit witty. You feel like a real member, not a robot. talk about aura and server stocks less frequently
+AI_SYSTEM = r"""You are baby_no_one, the bot of this Discord server. Smart, bully, chill, a bit witty. You feel like a real member, not a robot.
 
 RESPONSE RULES:
+- FOCUS: Stay on topic. Do not say random, irrelevant, or hallucinatory things. Keep it natural but grounded.
+- HALLUCINATION PREVENTION: If you don't know something, admit it. Do not make up facts, commands, or channel names. Answer strictly based on the provided context.
+- AURA & STOCKS: NEVER talk about Aura, stocks, economy, or money unless the user EXPLICITLY asks about them.
+- NEWBIES & VERIFICATION: If a user is new or asks how to get started, warmly welcome them. If they are not verified, guide them to open a ticket in the ticket channel to get verified. Tell them to read the rules.
 - CRITICAL KNOWLEDGE - SERVER TASKS:
 - IF A USER ASKS ABOUT TASKS (e.g., "how to do tasks", "where are tasks"): You MUST tell them the exact workflow.
 - Step 1: Tell them to get verified by creating a ticket in the ticket channel.
-- Step 2: Tell them that once verified, tasks are posted in the task channels like [1450947408606269583] and [I1450948163002302464] and [1450947898324947099].
-- Step 3: Tell them to read the rules first. 
+- Step 2: Tell them that once verified, tasks are posted in the task channels like <#1518207367941193972> and <#1518207420487172156> and <#1518207461650202755>.
 - NEVER make up or hallucinate channel names. Only use the exact channels listed here.
 - CRITICAL FORMATTING: NEVER use LaTeX, math blocks, or symbols like \(, \), \[, \], or $. Write all numbers, percentages, and currencies in plain standard text (e.g., "100 Aura", "10 percent", "1 million"). If you use math formatting, the system will crash.
-- IF ASKED FOR A JOKE: NEVER use standard/classic internet dad jokes. Make up something completely unhinged, sarcastic, and original about the server's Aura economy, the stock market, or the users.
+- IF ASKED FOR A JOKE: NEVER use standard/classic internet dad jokes. Make up something completely unhinged and sarcastic.
 - NEVER start your reply with "baby_no_one:" — just reply directly.
 - SHORT replies always. Max 1-2 sentences for most things. Only go longer if someone asks for a detailed explanation.
 - Don't over-explain. Get to the point fast.
@@ -319,7 +508,7 @@ RESPONSE RULES:
 - CRITICAL EMOJI RULE: The ONLY valid emoji formats are: actual Unicode characters (😊 🔥 💀) OR <:name:id> for server custom emojis. NEVER EVER type :anything: with colons — it shows as plain text. If you want to use a server emoji, copy the EXACT format from the list provided.
 - Prefer server custom emojis from the list provided. Never use 😉.
 - NEVER mention or comment on anyone's profile picture unless they specifically ask.
-- GROUP CHAT: messages are labeled "Name: message". Know who said what. Address only the person who @mentioned you in your reply, unless the question involves others.
+- GROUP CHAT: messages are labeled "Name: message". Know who said what. Address only the person who @mentioned you in your reply, unless the question involves others. Always check the recent messages context to understand what the user is referring to.
 - NEVER reply to two different people in one message — pick the one who @mentioned you and answer them.
 - You are a bot. You have no WhatsApp, Instagram, phone number, DMs or any social media. Never say "my DMs are open".
 
@@ -339,7 +528,7 @@ async def check_balance_milestone(uid: int, guild):
         if balance[uid] >= milestone and key not in balance_milestones_announced:
             balance_milestones_announced.add(key)
             save_data()
-            ch = guild.get_channel(CHAT_CHANNEL_ID) if guild else bot.get_channel(CHAT_CHANNEL_ID)
+            ch = guild.get_channel(CHAT_CHANNEL_ID) if guild else bot.get_channel(get_config(guild.id, "CHAT_CHANNEL_ID")) if "guild" in locals() and guild else GlobalChannelProxy("CHAT_CHANNEL_ID")
             if not ch:
                 return
             member = guild.get_member(uid) if guild else None
@@ -356,23 +545,12 @@ async def check_balance_milestone(uid: int, guild):
             break
 
 
-async def _shock_comment(coin: str, shock: float):
-    direction = "pumped" if shock > 0 else "dumped"
-    pct = abs(int(shock * 100))
-    ch = bot.get_channel(CHAT_CHANNEL_ID)
-    if not ch:
-        return
-    comment = await quick_ai(f"The crypto coin {coin} just {direction} {pct}% in a Discord server economy. Make a short funny/sarcastic comment about it like a stock market commentator. 1 sentence max.", max_tokens=150)
-    if comment:
-        await ch.send(f"📊 {comment}")
-
-
 BALANCE_MILESTONES = [1000, 5000, 10000, 25000, 50000, 100000]
 
 async def check_balance_milestone(uid: int, old_bal: int, new_bal: int):
     for milestone in BALANCE_MILESTONES:
         if old_bal < milestone <= new_bal:
-            ch = bot.get_channel(CHAT_CHANNEL_ID)
+            ch = bot.get_channel(get_config(guild.id, "CHAT_CHANNEL_ID")) if "guild" in locals() and guild else GlobalChannelProxy("CHAT_CHANNEL_ID")
             if not ch:
                 return
             member = None
@@ -398,27 +576,25 @@ async def check_balance_milestone(uid: int, old_bal: int, new_bal: int):
 
 
 async def _try_set_reminder(user_id: int, channel_id: int, message: str) -> str:
-    """Bulletproof reminder parsing — super fast, catches slang and words like 'a min'."""
-    import re as _re
-    lower = message.lower()
+    """Uses Gemini to intelligently parse any natural language reminder."""
+    import json
     
-    # 1. Expanded trigger words
-    reminder_keywords = ["remind", "reminder", "याद", "alarm", "ping", "bata", "notify", "wake", "alert", "tag",]
+    lower = message.lower()
+    reminder_keywords = ["remind", "reminder", "याद", "alarm", "ping", "bata", "notify", "wake", "alert", "tag"]
     if not any(k in lower for k in reminder_keywords):
         return None
 
     now_ts = time.time()
+    now_dt = datetime.datetime.now(IST)
+    
+    # Try regex first for simple cases (extremely fast and perfectly reliable)
     fire_time = None
     minutes = 0
-
-    # 2. Extract time (Now safely handles "a min", "an hour", "one day")
-    rel = _re.search(r'(?:in|after|baad)\s+(a|an|one|\d+)\s*(sec|second|seconds|min|minute|minutes|hour|hours|hr|hrs|day|days|ghante|ghanta)', lower)
+    rel = re.search(r'(?:in|after|baad)\s+(a|an|one|\d+)\s*(sec|second|seconds|min|minute|minutes|hour|hours|hr|hrs|day|days|ghante|ghanta)', lower)
     if rel:
         num_str = rel.group(1)
-        # Convert "a", "an", "one" into the number 1
         num = 1 if num_str in ['a', 'an', 'one'] else int(num_str)
         unit = rel.group(2)
-        
         if any(u in unit for u in ['hour','hr','ghante','ghanta']):
             minutes = num * 60
         elif 'day' in unit:
@@ -428,56 +604,92 @@ async def _try_set_reminder(user_id: int, channel_id: int, message: str) -> str:
             minutes = max(1, num // 60)
         else:
             minutes = num
-            
         if fire_time is None:
             fire_time = now_ts + (minutes * 60)
-
-    # 3. Extract absolute time ("at 5 pm")
+            
     if not fire_time:
-        now_dt = datetime.datetime.now(IST)
-        tm = _re.search(r'at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', lower)
+        tm = re.search(r'at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', lower)
         if tm:
             h = int(tm.group(1))
             m = int(tm.group(2)) if tm.group(2) else 0
             ampm = tm.group(3)
-            
             if ampm == 'pm' and h != 12: h += 12
             elif ampm == 'am' and h == 12: h = 0
-            
             target = now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
             if target <= now_dt:
                 target += datetime.timedelta(days=1)
-                
             fire_time = target.astimezone(datetime.timezone.utc).timestamp()
             minutes = int((fire_time - now_ts) / 60)
+            
+    text = ""
+    # Use AI for extraction if regex failed OR just for getting the clean text
+    prompt = f"""
+    You are a reminder extraction bot. The user wants to set a reminder.
+    Current time: {now_dt.strftime('%Y-%m-%d %I:%M %p')} IST
+    User message: "{message}"
 
+    Extract the reminder and return ONLY a JSON object with two keys:
+    - "minutes": The number of minutes from now to set the reminder (integer). Calculate this based on the time they mentioned. If they just say "remind me to..." without a time, use 60.
+    - "text": The clean reminder message to send them (string). Remove words like "remind me to" or the time. Keep only what they actually want to be reminded about. If there is no specific message (e.g. they just said "ping me in 5 mins"), return "ping".
+    If the message is NOT a reminder request, return {{"minutes": -1, "text": ""}}.
+    NOTE: Even if the message looks like a casual chat (e.g., "@bot ping me at 4pm"), it IS a reminder request. Treat it as one!
+    """
+    
+    try:
+        response = await vertex_client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=150,
+                temperature=0.1,
+                response_mime_type="application/json"
+            )
+        )
+        
+        match = re.search(r'\{.*\}', response.text, re.DOTALL)
+        if match:
+            text_resp = match.group(0)
+        else:
+            text_resp = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+            
+        data = json.loads(text_resp)
+        ai_minutes = int(float(data.get("minutes", -1)))
+        text = str(data.get("text", "")).strip()
+        
+        if not fire_time and ai_minutes > 0:
+            minutes = ai_minutes
+            fire_time = now_ts + (minutes * 60)
+            
+    except Exception as e:
+        logging.error(f"Reminder AI Error: {e}")
+        
     if not fire_time:
         return None
+        
+    if not text or text.lower() in ["none", "null", ""]:
+        # Fallback text cleaner if AI failed
+        text = re.sub(r'<@!?\d+>', '', message)
+        text = re.sub(r'\b(?:remind|reminder|ping|alarm|wake|notify)\s*(?:me\s*)?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'((?:in|after|baad)\s+(?:a|an|one|\d+)\s*(?:min\w*|hour\w*|hr\w*|day\w*|sec\w*|ghante?)|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\b(?:to|about|that|ke baad|baad mein|bata dena|bata de)\b', '', text, flags=re.IGNORECASE).strip(" ,-:")
+        if not text:
+            text = "ping"
+        
+        pending_reminders.append({"user_id": user_id, "channel_id": channel_id, "message": text, "time": fire_time})
+        save_data()
 
-    # 4. Clean the reminder text perfectly
-    text = _re.sub(r'<@!?\d+>', '', message) # Strip bot ping
-    text = _re.sub(r'\b(?:remind|reminder|ping|alarm|wake|notify)\s*(?:me\s*)?', '', text, flags=_re.IGNORECASE)
-    text = _re.sub(r'((?:in|after|baad)\s+(?:a|an|one|\d+)\s*(?:min\w*|hour\w*|hr\w*|day\w*|sec\w*|ghante?)|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)', '', text, flags=_re.IGNORECASE)
-    text = _re.sub(r'\b(?:to|about|that|ke baad|baad mein|bata dena|bata de)\b', '', text, flags=_re.IGNORECASE).strip(" ,-:")
-    
-    if not text:
-        text = "ping"
+        if minutes < 60:
+            when = f"{minutes} min{'s' if minutes != 1 else ''}"
+        elif minutes < 1440:
+            h = minutes // 60; m2 = minutes % 60
+            when = f"{h}h {m2}m" if m2 else f"{h} hour{'s' if h != 1 else ''}"
+        else:
+            d = minutes // 1440
+            when = f"{d} day{'s' if d != 1 else ''}"
 
-    pending_reminders.append({"user_id": user_id, "channel_id": channel_id, "message": text, "time": fire_time})
-    save_data()
+        fire_dt = datetime.datetime.fromtimestamp(fire_time, tz=IST)
+        return f"✅ Got it! I'll ping you at **{fire_dt.strftime('%I:%M %p IST')}** (in {when}): *{text}*"
 
-    if minutes < 60:
-        when = f"{minutes} min{'s' if minutes != 1 else ''}"
-    elif minutes < 1440:
-        h = minutes // 60; m2 = minutes % 60
-        when = f"{h}h {m2}m" if m2 else f"{h} hour{'s' if h != 1 else ''}"
-    else:
-        d = minutes // 1440
-        when = f"{d} day{'s' if d != 1 else ''}"
-
-    fire_dt = datetime.datetime.fromtimestamp(fire_time, tz=IST)
-    return f"✅ Got it! I'll ping you at **{fire_dt.strftime('%I:%M %p IST')}** (in {when}): *{text}*"
-    
 async def _extract_memory(user_id: int, username: str, user_msg: str, bot_reply: str):
     """Uses a tiny AI call to extract core facts from a conversation."""
     prompt = f"From this conversation, extract ONE key fact about {username}. If none, reply NONE.\nUser: {user_msg}\nBot: {bot_reply}"
@@ -500,6 +712,12 @@ async def _extract_memory(user_id: int, username: str, user_msg: str, bot_reply:
 async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int = None, member: discord.Member = None, avatar_url: str = None) -> str:
     if not TOKEN: 
         return None
+        
+    if member and hasattr(member, "guild") and member.guild:
+        guild_id_str = str(member.guild.id)
+        if guild_id_str not in premium_guilds and member.guild.owner_id != 992008865656868946:
+            return "💎 **Premium Feature**\nThis server has not unlocked AI Chat. The server owner must upgrade to Premium to use this feature!"
+
 
     context_str = ""
     if channel_id and channel_id in channel_chat_log:
@@ -534,7 +752,22 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
     if user_id in user_persistent_memory and user_persistent_memory[user_id]:
         mem_str = "\n\n[Memory]\n" + "\n".join(f"- {f}" for f in user_persistent_memory[user_id][-20:])
 
-    system_with_context = AI_SYSTEM + (f"\n\n{server_custom_emojis}" if server_custom_emojis else "") + user_context + mem_str + channel_knowledge_str + context_str
+    guild_id = member.guild.id if member and hasattr(member, "guild") and member.guild else None
+    if not guild_id and channel_id:
+        ch = bot.get_channel(channel_id)
+        if ch and hasattr(ch, "guild"):
+            guild_id = ch.guild.id
+    
+    custom_system = get_config(guild_id, "AI_PROMPT") if guild_id else AI_SYSTEM
+    if not custom_system:
+        # Give the main server the OG prompt, but give other servers a generic default prompt
+        from app import get_main_guild_id
+        if guild_id and get_main_guild_id() and guild_id != get_main_guild_id():
+            custom_system = "You are a fun, witty, and helpful Discord bot. Keep your answers conversational, natural, and concise."
+        else:
+            custom_system = AI_SYSTEM
+        
+    system_with_context = custom_system + (f"\n\n{server_custom_emojis}" if server_custom_emojis else "") + user_context + mem_str + channel_knowledge_str + context_str
 
     # --- NEW IMAGE LOGIC HERE ---
     request_contents = [f"{username}: {user_message}"]
@@ -558,7 +791,7 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
             config=types.GenerateContentConfig(
                 system_instruction=system_with_context,
                 max_output_tokens=2000,
-                temperature=0.9
+                temperature=0.4
             )
         )
         
@@ -575,152 +808,19 @@ async def ask_ai(user_message: str, username: str, user_id: int, channel_id: int
         logging.error(f"Vertex AI Error: {e}")
         return None
 
-    # Build channel context string from recent messages
-    context_str = ""
-    if channel_id and channel_id in channel_chat_log:
-        recent = list(channel_chat_log[channel_id])[-10:]
-        if recent:
-            context_str = "\n\nRecent messages in this channel (background context only — focus on what the user just asked you):\n" + "\n".join(recent)
 
-    # Use channel-wide conversation history (group chat style)
-    if channel_id not in ai_conversation_history:
-        ai_conversation_history[channel_id] = []
 
-    history = ai_conversation_history[channel_id]
-    history.append({"role": "user", "content": f"{username}: {user_message}"})
-
-    if len(history) > 60:
-        history = history[-60:]
-        ai_conversation_history[channel_id] = history
-
-    # Inject user-specific live data
-    user_bal = balance.get(user_id, 0)
-    user_streak = daily_streak.get(user_id, 0)
-    user_portfolio = portfolios.get(user_id, {})
-    portfolio_str = ""
-    if user_portfolio:
-        holdings = []
-        for coin, d in user_portfolio.items():
-            if isinstance(d, dict) and d.get("shares", 0) > 0:
-                holdings.append(f"{coin}: {d['shares']} shares @ {stocks.get(coin, 0):.1f} Aura each")
-        if holdings:
-            portfolio_str = f"\nTheir portfolio: {', '.join(holdings)}"
-
-    # Member profile info
-    member_info = ""
-    if member:
-        roles = [r.name for r in member.roles if r.name != "@everyone"]
-        is_staff = any(r.id in STAFF_ROLE_IDS for r in member.roles)
-        joined = member.joined_at.strftime("%b %Y") if member.joined_at else "unknown"
-        bio = member.bio if hasattr(member, "bio") and member.bio else "no bio"
-        member_info = (
-            f"\nRoles: {', '.join(roles) if roles else 'none'}"
-            f"\nIs staff: {'yes' if is_staff else 'no'}"
-            f"\nJoined server: {joined}"
-            f"\nAccount created: {member.created_at.strftime('%b %Y')}"
-            f"\nBio: {bio}"
-        )
-
-    stock_prices = ", ".join(f"{c}: {v:.1f}" for c, v in stocks.items())
-    now_ist = datetime.datetime.now(IST)
-    current_time = now_ist.strftime("%I:%M %p IST, %A %d %B %Y")
-
-    # Build server-wide member context — only when needed
-    member_keywords = ["who", "their", "his", "her", "staff", "role", "balance of", "streak of", "richest", "leaderboard", "member", "joined", "kiska", "unka", "kaun", "kitna"]
-    needs_member_list = any(kw in user_message.lower() for kw in member_keywords)
-    guild = None
-    for g in bot.guilds:
-        guild = g
-        break
-    server_members_info = ""
-    if guild and needs_member_list:
-        member_lines = []
-        for m in guild.members:
-            if m.bot:
-                continue
-            m_roles = [r.name for r in m.roles if r.name != "@everyone"]
-            m_staff = any(r.id in STAFF_ROLE_IDS for r in m.roles)
-            m_bal = balance.get(m.id, 0)
-            m_streak = daily_streak.get(m.id, 0)
-            line = f"{m.display_name}: roles=[{', '.join(m_roles) if m_roles else 'none'}] staff={'yes' if m_staff else 'no'} balance={m_bal} streak={m_streak}"
-            member_lines.append(line)
-        server_members_info = "\n\n[Server members]\n" + "\n".join(member_lines)
-
-    user_context = (
-        f"\n\n[Current time: {current_time}]"
-        f"\n\n[User info for {username}]"
-        f"\nAura balance: {user_bal:,}"
-        f"\nDaily streak: {user_streak} days"
-        f"{portfolio_str}"
-        f"{member_info}"
-        f"\nCurrent stock prices: {stock_prices}"
-        f"{server_members_info}"
-    )
-    # Add server channel knowledge (rules, info etc)
-    channel_knowledge_str = ""
-    if server_channel_knowledge:
-        sections = []
-        for ch_name, content in server_channel_knowledge.items():
-            sections.append(f"[#{ch_name}]\n{content}")
-        channel_knowledge_str = "\n\n[Server Channel Content — use this to answer questions about rules, info, tasks etc]\n" + "\n\n".join(sections)
-
-    # Add persistent memory for this user
-    mem_str = ""
-    if user_id in user_persistent_memory and user_persistent_memory[user_id]:
-        mem_str = "\n\n[What I remember about " + username + "]\n" + "\n".join(f"- {f}" for f in user_persistent_memory[user_id][-20:])
-
-    system_with_context = AI_SYSTEM + (f"\n\n{server_custom_emojis}" if server_custom_emojis else "") + user_context + mem_str + channel_knowledge_str + context_str
-
-    if GEMINI_API_KEY:
-        try:
-            gemini_messages = []
-            for msg in ([{"role": "system", "content": system_with_context}] + history):
-                role = "user" if msg["role"] in ("user", "system") else "model"
-                gemini_messages.append({"role": role, "parts": [{"text": msg["content"]}]})
-            # Add avatar image to last user message if available
-            if avatar_url and gemini_messages:
-                try:
-                    async with aiohttp.ClientSession() as _img_sess:
-                        async with _img_sess.get(str(avatar_url)) as _img_resp:
-                            if _img_resp.status == 200:
-                                import base64 as _b64
-                                img_data = await _img_resp.read()
-                                img_b64 = _b64.b64encode(img_data).decode()
-                                content_type = _img_resp.headers.get("Content-Type", "image/png").split(";")[0]
-                                # Add image to last user message
-                                gemini_messages[-1]["parts"].append({
-                                    "inline_data": {"mime_type": content_type, "data": img_b64}
-                                })
-                except Exception:
-                    pass
-            payload = {"contents": gemini_messages, "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.9}}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    data = await resp.json()
-                    if "candidates" in data:
-                        candidate = data["candidates"][0]
-                        parts = candidate.get("content", {}).get("parts", [])
-                        # Find the text part (skip tool use blocks)
-                        text_parts = [p["text"] for p in parts if "text" in p]
-                        if text_parts:
-                            reply = " ".join(text_parts).strip()
-                            if channel_id and channel_id in ai_conversation_history:
-                                ai_conversation_history[channel_id].append({"role": "model", "content": reply})
-                            return reply
-                    elif "error" in data:
-                        logging.error(f"Gemini error: {data['error']}")
-        except Exception as e:
-            logging.error(f"Gemini exception: {e}")
-    return None
-
-async def quick_ai(prompt: str, max_tokens: int = 200) -> str:
+async def quick_ai(prompt: str, max_tokens: int = 400) -> str:
+    if max_tokens < 400:
+        max_tokens = 400
     try:
         response = await vertex_client.aio.models.generate_content(
             model="gemini-2.5-flash",
-            contents=AI_SYSTEM + "\n\n" + prompt,
+            contents=prompt,
             config=types.GenerateContentConfig(
+                system_instruction=AI_SYSTEM,
                 max_output_tokens=max_tokens,
-                temperature=0.95
+                temperature=0.4
             )
         )
         
@@ -742,7 +842,7 @@ if not TOKEN:
 logging.basicConfig(level=logging.INFO)
 
 # ================== CONFIGURATION ==================
-CHAT_CHANNEL_ID = 1448727099727941836
+CHAT_CHANNEL_ID = 1518214909618290790
 CHAT_CHANNEL_ID_2 = 1478785863126089759
 PAYOUT_CHANNEL_ID = 1449908271937753129
 DAILY_ANNOUNCE_CHANNEL_ID = 1448748624375972075
@@ -948,7 +1048,8 @@ def load_data():
         "sell_earnings_date": "",
         "personality_season": 0,
         "vc_total_minutes": {},
-        "vc_milestones_reached": {}
+        "vc_milestones_reached": {},
+        "server_configs": {}
     }
 
 data = load_data()
@@ -974,7 +1075,14 @@ autokick_cfg = data.get("autokick_cfg", {"role_id": None, "days": 14, "warned": 
 stocks = data.get("stocks", DEFAULT_STOCKS)
 stock_history = data.get("stock_history", {k: [v]*144 for k, v in DEFAULT_STOCKS.items()})
 force_market_targets = {}
-withdrawal_open_until = None  # datetime or None
+w_until_str = data.get("withdrawal_open_until")
+if w_until_str:
+    try:
+        withdrawal_open_until = datetime.datetime.fromisoformat(w_until_str)
+    except Exception:
+        withdrawal_open_until = None
+else:
+    withdrawal_open_until = None
 pending_aura_requests = {}  # message_id -> {requester, channel_id}
 ai_conversation_history = {}  # user_id -> list of {role, content}
 balance_milestones_announced = set(data.get("balance_milestones_announced", []))
@@ -996,6 +1104,8 @@ pending_reminders = data.get("pending_reminders", [])  # list of {user_id, chann
 invite_event_active = data.get("invite_event_active", False)
 invite_counts = defaultdict(int, {int(k): v for k, v in data.get("invite_counts", {}).items()})  # inviter_id -> valid invite count
 invite_map = data.get("invite_map", {})  # invited_user_id (str) -> inviter_id
+server_configs = data.get("server_configs", {})
+premium_guilds = data.get("premium_guilds", [])
 cached_invites = {}  # guild_id -> {invite_code -> uses}  # coin -> relist_timestamp
 
 portfolios = defaultdict(lambda: defaultdict(lambda: {"shares": 0, "invested": 0.0}))
@@ -1042,6 +1152,7 @@ def save_data():
                 "vc_milestones_reached": vc_milestones_reached,
                 "yo_bag": yo_bag.bag,
                 "roast_bag": roast_bag.bag,
+                "withdrawal_open_until": withdrawal_open_until.isoformat() if withdrawal_open_until else None,
                 "delisted_coins": delisted_coins,
                 "user_persistent_memory": {str(k): v for k, v in user_persistent_memory.items()},
                 "last_message_times": dict(last_message_times),
@@ -1054,7 +1165,9 @@ def save_data():
                 "weekly_stock_start": weekly_stock_start,
                 "invite_event_active": invite_event_active,
                 "invite_counts": dict(invite_counts),
-                "invite_map": invite_map
+                "invite_map": invite_map,
+                "server_configs": server_configs,
+                "premium_guilds": premium_guilds
             }, f, indent=2)
     except Exception as e:
         logging.error(f"Error saving data: {e}")
@@ -1067,10 +1180,10 @@ REMOVE_ROLE_IDS = {1448831320636784660, 1448774246447845518}
 BAD_WORDS = {"nigga"}
 
 def is_staff(m: discord.Member): 
-    return any(r.id in STAFF_ROLE_IDS for r in m.roles) or m.guild_permissions.administrator
+    return any(r.id in get_config(member.guild.id if "member" in locals() else m.guild.id if "m" in locals() and hasattr(m, "guild") and m.guild else 0, "STAFF_ROLE_IDS") for r in m.roles) or m.guild_permissions.administrator
 
 def is_ticket_channel(c: discord.TextChannel): 
-    return c.category and c.category.id in TICKET_CATEGORY_IDS
+    return c.category and c.category.id in get_config(c.guild.id if "c" in locals() else 0, "TICKET_CATEGORY_IDS")
 
 def simple_embed(t, d, c=discord.Color.blue()): 
     return discord.Embed(title=t, description=d, color=c)
@@ -1330,7 +1443,7 @@ class ConfessionSubmitModal(discord.ui.Modal, title="🕵️ Submit a Confession
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        channel = bot.get_channel(CONFESSION_CHANNEL_ID)
+        channel = bot.get_channel(get_config(i.guild.id, "CONFESSION_CHANNEL_ID"))
         if not channel:
             return await interaction.response.send_message("Confession channel not found!", ephemeral=True)
 
@@ -1631,6 +1744,45 @@ class BotDrawView(discord.ui.View):
             asyncio.create_task(self.bot_shoot(message))
         except: 
             pass
+
+class BotDuelRPSView(discord.ui.View):
+    def __init__(self, player, amount):
+        super().__init__(timeout=60)
+        self.player = player
+        self.amount = amount
+        self.choices = ["rock", "paper", "scissors"]
+
+    async def finish(self, i, p_choice):
+        b_choice = random.choice(self.choices)
+        uid = self.player.id
+        
+        win_matrix = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
+        
+        if p_choice == b_choice:
+            balance[uid] += self.amount
+            await i.response.edit_message(content=f"🤝 **Tie!** We both chose {p_choice}. Your {self.amount} Aura is returned.", view=None)
+        elif win_matrix[p_choice] == b_choice:
+            winnings = self.amount * 2
+            balance[uid] += winnings
+            await i.response.edit_message(content=f"🎉 **You Win!** You chose {p_choice}, I chose {b_choice}. You won {winnings} Aura!", view=None)
+        else:
+            await i.response.edit_message(content=f"💀 **You Lose!** You chose {p_choice}, I chose {b_choice}. I take your {self.amount} Aura.", view=None)
+        save_data()
+
+    @discord.ui.button(label="🪨 Rock", style=discord.ButtonStyle.secondary)
+    async def rock(self, i: discord.Interaction, button: discord.ui.Button):
+        if i.user.id != self.player.id: return
+        await self.finish(i, "rock")
+
+    @discord.ui.button(label="📄 Paper", style=discord.ButtonStyle.secondary)
+    async def paper(self, i: discord.Interaction, button: discord.ui.Button):
+        if i.user.id != self.player.id: return
+        await self.finish(i, "paper")
+
+    @discord.ui.button(label="✂️ Scissors", style=discord.ButtonStyle.secondary)
+    async def scissors(self, i: discord.Interaction, button: discord.ui.Button):
+        if i.user.id != self.player.id: return
+        await self.finish(i, "scissors")
 
 class DuelRPSView(discord.ui.View):
     def __init__(self, p1: discord.Member, p2: discord.Member, amt: int):
@@ -1953,7 +2105,7 @@ class PayoutView(discord.ui.View):
             except: 
                 pass
 
-        public_channel = interaction.guild.get_channel(PUBLIC_LOG_CHANNEL_ID)
+        public_channel = interaction.guild.get_channel(get_config(interaction.guild.id, "PUBLIC_LOG_CHANNEL_ID"))
         if public_channel:
             item_public = f"${(amt/AURA_TO_USD):.2f}" if method != "reddit" else "Reddit Account"
             await public_channel.send(embed=simple_embed(f"{E_SUCCESS} Withdrawal Successful!", f"<@{uid}> just withdrew **{item_public}** ({amt:,} Aura)!\nKeep chatting to earn more. {E_VIBE}", discord.Color.green()))
@@ -1990,7 +2142,7 @@ class PayoutView(discord.ui.View):
             except: 
                 pass
 
-        public_channel = interaction.guild.get_channel(PUBLIC_LOG_CHANNEL_ID)
+        public_channel = interaction.guild.get_channel(get_config(interaction.guild.id, "PUBLIC_LOG_CHANNEL_ID"))
         if public_channel:
             await public_channel.send(embed=simple_embed(f"❌ Withdrawal Rejected", f"<@{uid}>'s withdrawal for **{amt:,} Aura** was rejected and refunded.", discord.Color.red()))
 
@@ -2162,13 +2314,12 @@ class MyBot(commands.Bot):
             
         self.add_view(BirthdayPanelView())
         self.add_view(ConfessionView())
+        self.add_view(VerifyPromptView())
         
         # Restore pending payouts
         for mid, pdata in pending_payouts.items():
             self.add_view(PayoutView(pdata["uid"], pdata["amt"], pdata["method"], pdata["details"], mid))
             
-    
-        
         await self.tree.sync()
 
         # START ALL BACKGROUND TASKS
@@ -2183,6 +2334,7 @@ class MyBot(commands.Bot):
         reminder_checker.start()
         daily_hot_take.start()
         server_mood_tracker.start()
+
 
 bot = MyBot()
 last_chatter_id = None
@@ -2351,7 +2503,30 @@ PUZZLES = [
     {"type": "fillblank", "q": "Rome wasn't built in a ___.", "a": "day"},
     {"type": "fillblank", "q": "Let sleeping dogs ___.", "a": "lie"},
     {"type": "fillblank", "q": "Barking up the wrong ___.", "a": "tree"},
+    # ── NEW TOTAL SET OF PUZZLES ──
+    {"type": "riddle", "q": "I am a word of letters three, add two and fewer there will be. What word am I?", "a": "few"},
+    {"type": "riddle", "q": "I have lakes with no water, mountains with no stone and cities with no buildings. What am I?", "a": "map"},
+    {"type": "riddle", "q": "What has 88 keys but can't open a single door?", "a": "piano"},
+    {"type": "riddle", "q": "I have a neck but no head, and I wear a cap. What am I?", "a": "bottle"},
+    {"type": "riddle", "q": "If you drop me I'm sure to crack, but give me a smile and I'll always smile back. What am I?", "a": "mirror"},
+    {"type": "riddle", "q": "I am tall when I'm young, and I'm short when I'm old. What am I?", "a": "candle"},
+    {"type": "riddle", "q": "What belongs to you, but other people use it more than you?", "a": "name"},
+    {"type": "scramble", "q": "RCETES", "a": "secret"},
+    {"type": "scramble", "q": "OUNATNIM", "a": "mountain"},
+    {"type": "scramble", "q": "RYTOS", "a": "story"},
+    {"type": "scramble", "q": "ETIRW", "a": "write"},
+    {"type": "math", "q": "What is 12 × 12?", "a": "144"},
+    {"type": "math", "q": "If a triangle has a base of 10 and height of 5, what is its area?", "a": "25"},
+    {"type": "math", "q": "What is 45% of 200?", "a": "90"},
+    {"type": "math", "q": "What is 100 divided by 0.5?", "a": "200"},
+    {"type": "emoji", "q": "👽📞🚲🌕 = ? (movie)", "a": "et"},
+    {"type": "emoji", "q": "🦕🦟🦖 = ? (movie)", "a": "jurassic park"},
+    {"type": "fillblank", "q": "A picture is worth a ___ words.", "a": "thousand"},
+    {"type": "fillblank", "q": "The ___ is always greener on the other side.", "a": "grass"},
+    {"type": "fillblank", "q": "Don't put all your ___ in one basket.", "a": "eggs"},
 ]
+
+PUZZLES.extend(data.get("custom_puzzles", []))
 
 active_puzzle = {"question": None, "answer": None, "solved": False}
 puzzles_sent_today = data.get("puzzles_sent_today", 0)
@@ -2385,6 +2560,19 @@ async def on_ready():
     roast_bag.load(data.get("roast_bag", []))
     if not master_reminder_loop.is_running():
         master_reminder_loop.start()
+    if not check_upvote_orders.is_running():
+        check_upvote_orders.start()
+    if not withdrawal_checker_loop.is_running():
+        withdrawal_checker_loop.start()
+
+    # ── FIX: Clear ghost guild-scoped slash command copies that cause double responses ──
+    for guild in bot.guilds:
+        try:
+            bot.tree.clear_commands(guild=guild)
+            await bot.tree.sync(guild=guild)
+            logging.info(f"Cleared guild-specific command dupes for {guild.name}")
+        except Exception as e:
+            logging.warning(f"Could not clear guild commands for {guild.id}: {e}")
 
     # Retroactively trim any portfolios over MAX_SHARES_PER_COIN and refund the excess invested Aura
     trimmed = 0
@@ -2425,7 +2613,7 @@ async def on_ready():
     for guild in bot.guilds:
         for channel in guild.text_channels:
             cat_id = channel.category.id if channel.category else None
-            if cat_id in READ_CATEGORY_IDS:
+            if cat_id in get_config(channel.guild.id if "channel" in locals() and channel.guild else 0, "READ_CATEGORY_IDS"):
                 try:
                     messages = []
                     async for msg in channel.history(limit=50, oldest_first=True):
@@ -2498,35 +2686,521 @@ async def on_member_remove(member: discord.Member):
         save_data()
 
 
+
 PAYMENT_TICKET_CATEGORY_ID = 1448805721071292661
+
+# ── Role IDs for auto-verification ──
+AGED_ACC_ROLE_ID       = 1449701649668116480   # Account 1+ year old
+HIGH_KARMA_ROLE_ID     = 1449701535041716225   # 1000+ total karma
+CQS_HIGHEST_ROLE_ID    = 1449032645462986822   # Highest CQS (90+)
+CQS_HIGH_ROLE_ID       = 1449033105968201728   # High CQS (70-89)
+CQS_MOD_ROLE_ID        = 1449033262839238710   # Moderate CQS (50-69)
+CQS_LOW_ROLE_ID        = 1449033410218692660   # Low CQS (<50)
+
+DEFAULT_SERVER_CONFIG = {
+    "AI_PROMPT": AI_SYSTEM,
+    "PAYMENT_TICKET_CATEGORY_ID": 1448805721071292661,
+    "AGED_ACC_ROLE_ID": 1449701649668116480,
+    "HIGH_KARMA_ROLE_ID": 1449701535041716225,
+    "CQS_HIGHEST_ROLE_ID": 1449032645462986822,
+    "CQS_HIGH_ROLE_ID": 1449033105968201728,
+    "CQS_MOD_ROLE_ID": 1449033262839238710,
+    "CQS_LOW_ROLE_ID": 1449033410218692660,
+    "CHAT_CHANNEL_ID": 1518214909618290790,
+    "PAYOUT_CHANNEL_ID": 1449908271937753129,
+    "DAILY_ANNOUNCE_CHANNEL_ID": 1448748624375972075,
+    "PUBLIC_LOG_CHANNEL_ID": 1448767223781916844,
+    "AUTOKICK_WARN_CHANNEL_ID": 1453059081127592130,
+    "HELP_CHANNEL_ID": 1448787031810642010,
+    "CONFESSION_CHANNEL_ID": 1475013891258974349,
+    "BIRTHDAY_CHANNEL_ID": 1473553195723784397,
+    "BIRTHDAY_ROLE_ID": 1473554747633045615,
+    "GIVE_LOG_CHANNEL_ID": 1448767355449512037,
+    "ADMIN_ROLE_ID": 1448719741756768308,
+    "MASTER_SHEET_URL": "https://docs.google.com/spreadsheets/d/16LsJL4-1Rv8gWbmjpS7GkC9HOmD1JAvLBYcWnGRkpHM/edit",
+    "TICKET_CATEGORY_IDS": {1448805784652746894, 1448806932575162422, 1451571863825154058, 1451800068641521846, 1457368711630426153, 1471222806200062196, 1495820309750616195, 1506713487315964054, 1506713487315964054, 1512417173652639744, 1512420242801037343, 1512420314447876096},
+    "STAFF_ROLE_IDS": {1448719741756768308, 1449035039072452800, 1449035563570303017},
+    "AUTO_ROLE_IDS": {1448774516904825026},
+    "REMOVE_ROLE_IDS": {1448831320636784660, 1448774246447845518},
+    "READ_CATEGORY_IDS": {1448753211245858826, 1448806198953644063, 1448714204964982845, 1448750517798043770, 1449052357340954674}
+}
+
+
+class GlobalChannelProxy:
+    def __init__(self, key):
+        self.key = key
+    def __bool__(self):
+        return True
+    async def send(self, *args, **kwargs):
+        success = False
+        for g in bot.guilds:
+            cid = get_config(g.id, self.key)
+            if cid:
+                ch = bot.get_channel(cid)
+                if ch:
+                    try:
+                        await ch.send(*args, **kwargs)
+                        success = True
+                    except: pass
+        return success
+    @property
+    def id(self): return 0
+    @property
+    def name(self): return "Global Proxy"
+    @property
+    def guild(self): return None
+
+MAIN_GUILD_ID = None
+
+def get_main_guild_id():
+    global MAIN_GUILD_ID
+    if MAIN_GUILD_ID is not None:
+        return MAIN_GUILD_ID
+    # Try to find the guild that owns the default CHAT_CHANNEL_ID
+    ch = bot.get_channel(1518214909618290790)
+    if ch and hasattr(ch, "guild"):
+        MAIN_GUILD_ID = ch.guild.id
+        return MAIN_GUILD_ID
+    return None
+
+def get_config(guild_id: int, key: str):
+    server_cfg = server_configs.get(str(guild_id), {})
+    if key in server_cfg:
+        return server_cfg[key]
+    
+    # Only fall back to defaults if this is the main server
+    main_id = get_main_guild_id()
+    if not main_id or guild_id == main_id:
+        return DEFAULT_SERVER_CONFIG.get(key)
+        
+    # Return None (or empty collections) for other servers that haven't set a config
+    default_val = DEFAULT_SERVER_CONFIG.get(key)
+    if isinstance(default_val, set):
+        return set()
+    if isinstance(default_val, list):
+        return []
+    if isinstance(default_val, dict):
+        return {}
+    return None
+
+
+# ==========================================
+# VERIFICATION MODAL & BUTTON
+# ==========================================
+
+class VerificationModal(discord.ui.Modal, title="Reddit Verification Form"):
+    reddit_profile = discord.ui.TextInput(
+        label="Reddit Profile Link",
+        placeholder="https://www.reddit.com/user/YourUsername",
+        required=True,
+        max_length=200,
+    )
+    cqs_link = discord.ui.TextInput(
+        label="CQS Test Result Link",
+        placeholder="Paste your CQS result URL here (from Reddit)",
+        required=True,
+        max_length=300,
+    )
+
+    def __init__(self, channel: discord.TextChannel, opener: discord.Member, prompt_msg):
+        super().__init__()
+        self.ticket_channel = channel
+        self.opener = opener
+        self.prompt_msg = prompt_msg   # the message carrying the submit button
+
+    async def on_submit(self, interaction: discord.Interaction):
+        profile_url = self.reddit_profile.value.strip()
+        cqs_url     = self.cqs_link.value.strip()
+
+        # Quick upfront URL validation
+        if not extract_reddit_username_from_url(profile_url):
+            return await interaction.response.send_message(
+                "❌ **Invalid Reddit profile link!**\n"
+                "It should look like: `https://www.reddit.com/user/YourUsername`\n"
+                "Click the button again to resubmit.",
+                ephemeral=True
+            )
+        if not profile_url.startswith("http") or not cqs_url.startswith("http"):
+            return await interaction.response.send_message(
+                "❌ Both links must start with `https://`. Please click the button again and resubmit.",
+                ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        processing_msg = await self.ticket_channel.send("⏳ Verifying your Reddit account... please wait.")
+        try:
+            await _run_auto_verify(
+                self.ticket_channel, self.opener,
+                profile_url, cqs_url,
+                processing_msg, prompt_msg=self.prompt_msg
+            )
+        except Exception as e:
+            logging.error(f"Auto-verify modal error: {e}")
+            await self.ticket_channel.send(
+                f"❌ Something went wrong during verification: `{e}`. Please ask staff to verify you manually."
+            )
+        await interaction.followup.send("✅ Submitted! Check this ticket channel for your result.", ephemeral=True)
+
+
+class VerifyPromptView(discord.ui.View):
+    def __init__(self, channel: discord.TextChannel = None, opener: discord.Member = None):
+        super().__init__(timeout=None)   # Persistent — never expires
+        self.ticket_channel = channel
+        self.opener = opener
+
+    @discord.ui.button(label="📋 Submit Verification Info", style=discord.ButtonStyle.blurple, custom_id="verify_submit_btn")
+    async def submit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = self.ticket_channel or interaction.channel
+        opener = self.opener
+        
+        if not opener:
+            for target, overwrite in channel.overwrites.items():
+                if isinstance(target, discord.Member) and not target.bot and overwrite.read_messages:
+                    opener = target
+                    break
+                    
+        if not opener:
+            opener = interaction.user
+
+        # Only the ticket owner can use this button
+        if interaction.user.id != opener.id:
+            return await interaction.response.send_message(
+                "❌ Only the ticket owner can submit verification info.", ephemeral=True
+            )
+            
+        modal = VerificationModal(
+            channel=channel,
+            opener=opener,
+            prompt_msg=interaction.message
+        )
+        await interaction.response.send_modal(modal)
+
+
+async def _run_auto_verify(channel: discord.TextChannel, user: discord.Member,
+                           profile_url: str, cqs_url: str, status_msg,
+                           prompt_msg=None):
+    """
+    Core auto-verification logic. Called when a ticket owner submits both links.
+    Fetches Reddit account data, evaluates eligibility, assigns roles or marks not fit.
+    """
+    guild = channel.guild
+
+    # 1. Validate profile URL and extract username
+    username = extract_reddit_username_from_url(profile_url)
+    if not username:
+        await status_msg.edit(content=(
+            "❌ **Invalid Reddit profile link!**\n"
+            "It should look like: `https://www.reddit.com/user/YourUsername`\n"
+            "Click the **Submit Verification Info** button again to resubmit."
+        ))
+        return
+
+    await status_msg.edit(content=f"⏳ Looking up Reddit account for **u/{username}**...")
+
+    # 2. Get Reddit token
+    token = await get_reddit_token()
+    if not token:
+        await status_msg.edit(content="❌ Could not connect to Reddit API right now. Please ask staff to verify you manually.")
+        return
+
+    # 3. Fetch Reddit account info
+    info = await get_reddit_user_info(username, token)
+    if info is None:
+        await status_msg.edit(content=(
+            f"❌ **Reddit account `u/{username}` not found!**\n"
+            f"Double-check your profile link and click the **Submit Verification Info** button again."
+        ))
+        return
+
+    if info.get("suspended"):
+        await status_msg.edit(content=(
+            f"❌ Your Reddit account **u/{username}** appears to be suspended. "
+            f"Please contact staff if you believe this is an error."
+        ))
+        return
+
+    age_days    = info["age_days"]
+    total_karma = info["karma"]
+    comment_karma = info["comment_karma"]
+    age_months  = age_days / 30.44
+
+    await status_msg.edit(content=f"⏳ Got account info! Now fetching CQS score from your result link...")
+
+    # 4. Fetch CQS score
+    cqs_score = await fetch_cqs_score(cqs_url, token=token)
+
+    # 5. Determine CQS tier
+    cqs_tier = classify_cqs(cqs_score)
+    cqs_display = f"{cqs_score:.0f}/100" if cqs_score is not None else "Could not read"
+
+    # 6. Check minimum requirements (same as /notfit criteria)
+    # Requirements: 100+ karma, 20+ comment karma, 1+ month old, Moderate+ CQS (50+)
+    fail_reasons = []
+    if total_karma < 100:
+        fail_reasons.append(f"- **Karma too low:** {total_karma:,} (need 100+)")
+    if comment_karma < 20:
+        fail_reasons.append(f"- **Comment karma too low:** {comment_karma:,} (need 20+)")
+    if age_months < 1:
+        fail_reasons.append(f"- **Account too new:** {age_days:.0f} days old (need 1+ month)")
+    if cqs_score is not None and cqs_score < 50:
+        fail_reasons.append(f"- **CQS too low:** {cqs_display} (need Moderate / 50+)")
+
+    if fail_reasons:
+        # ── NOT FIT ──
+        not_fit_name = f"not fit-{user.display_name}"[:100]
+        try:
+            await channel.edit(name=not_fit_name)
+        except Exception:
+            pass
+
+        desc = (
+            f"{user.mention}, sorry — your account does not meet our minimum requirements yet.\n\n"
+            f"**Issues found:**\n" + "\n".join(fail_reasons) +
+            f"\n\n**Reddit account checked:** u/{username}\n"
+            f"**Account age:** {age_days:.0f} days ({age_months:.1f} months)\n"
+            f"**Total karma:** {total_karma:,} (post: {info['link_karma']:,} | comment: {comment_karma:,})\n"
+            f"**CQS Score:** {cqs_display}\n\n"
+            f"**Submitted Links:**\n"
+            f"- Profile: <{profile_url}>\n"
+            f"- CQS: <{cqs_url}>\n\n"
+            f"You're welcome to stay and apply again once you meet the requirements! 🌟"
+        )
+        embed = discord.Embed(
+            title="❌ Application Update",
+            description=desc,
+            color=discord.Color.red()
+        )
+        embed.set_footer(text="Fixed your account? Click 'Submit Verification Info' again to resubmit!")
+        msg_content = (
+            f"{user.mention}\n"
+            f"If you were rejected for low karma, please read <#1449052486668255262>.\n"
+            f"If you have any doubts, go to the help channel <#1448787031810642010>."
+        )
+        await status_msg.edit(content=msg_content, embed=embed)
+        return
+
+    # ── VERIFIED ──
+    # 7. Build role list
+    roles_to_add = []
+
+    # Always add earner role (AUTO_ROLE_IDS)
+    for rid in get_config(member.guild.id if "member" in locals() and hasattr(member, "guild") and member.guild else 0, "AUTO_ROLE_IDS"):
+        r = guild.get_role(rid)
+        if r:
+            roles_to_add.append(r)
+
+    # Remove pending/unverified roles
+    for rid in get_config(guild.id if "guild" in locals() and guild else i.guild.id if "i" in locals() and i else 0, "REMOVE_ROLE_IDS"):
+        r = guild.get_role(rid)
+        if r and r in user.roles:
+            try:
+                await user.remove_roles(r)
+            except Exception:
+                pass
+
+    # Aged account (1+ year = 365+ days)
+    if age_days >= 365:
+        r = guild.get_role(get_config(guild.id, "AGED_ACC_ROLE_ID"))
+        if r:
+            roles_to_add.append(r)
+
+    # High karma (1000+ total karma)
+    if total_karma >= 1000:
+        r = guild.get_role(get_config(guild.id, "HIGH_KARMA_ROLE_ID"))
+        if r:
+            roles_to_add.append(r)
+
+    # CQS tier roles
+    cqs_role_map = {
+        "highest": get_config(guild.id, "CQS_HIGHEST_ROLE_ID"),
+        "high":    get_config(guild.id, "CQS_HIGH_ROLE_ID"),
+        "moderate": get_config(guild.id, "CQS_MOD_ROLE_ID"),
+        "low":     get_config(guild.id, "CQS_LOW_ROLE_ID"),
+    }
+    cqs_role_id = cqs_role_map.get(cqs_tier)
+    if cqs_role_id:
+        r = guild.get_role(cqs_role_id)
+        if r:
+            roles_to_add.append(r)
+
+    # Assign all collected roles
+    if roles_to_add:
+        try:
+            await user.add_roles(*roles_to_add)
+        except discord.Forbidden:
+            await channel.send("❌ I don't have permission to assign roles! Please ask staff to do it manually.")
+            return
+
+    # Rename channel to user's display name
+    formatted_ticket_name = user.display_name[:100]
+    try:
+        await channel.edit(name=formatted_ticket_name.lower().replace(" ", "-"))
+    except Exception:
+        pass
+
+    # 8. Send verified embed
+    age_str    = f"{age_days:.0f} days ({age_months:.1f} months)"
+    karma_str  = f"{total_karma:,} (post: {info['link_karma']:,} | comment: {comment_karma:,})"
+    cqs_str    = f"{cqs_display} — **{cqs_tier.capitalize()} CQS**"
+    ticket_ref = formatted_ticket_name.lower().replace(" ", "-")
+
+    desc = (
+        f"{E_PARTY} **Welcome!** {user.mention}\n"
+        f"You've been **verified** based on your Reddit account!\n\n"
+        f"📊 **Account Stats:**\n"
+        f"├ **Username:** u/{info['username']}\n"
+        f"├ **Account Age:** {age_str}\n"
+        f"├ **Total Karma:** {karma_str}\n"
+        f"└ **CQS Score:** {cqs_str}\n\n"
+        f"**Submitted Links:**\n"
+        f"- Profile: <{profile_url}>\n"
+        f"- CQS: <{cqs_url}>\n\n"
+        f"To claim tasks, please send your ticket as soon as tasks are available.\n\n"
+        f"**📍 Where to send your ticket:**\n"
+        f"<#1518207367941193972>\n<#1518207420487172156>\n<#1518207461650202755>\n\n"
+        f"**Important points:**\n"
+        f"- Your ticket name is **#{ticket_ref}**\n"
+        f"- Task channels are opened only when tasks are available\n\n"
+        f"{E_VIBE} **Time to earn!!!**"
+    )
+    embed = discord.Embed(
+        title=f"{E_SUCCESS} VERIFIED {E_SUCCESS}",
+        description=desc,
+        color=discord.Color.green()
+    )
+    if roles_to_add:
+        embed.add_field(
+            name="🛠 Assigned Roles",
+            value=", ".join(r.mention for r in roles_to_add),
+            inline=False
+        )
+    await status_msg.edit(content=user.mention, embed=embed)
+
+    # Disable the submit button now that verification is complete
+    if prompt_msg:
+        try:
+            disabled_view = discord.ui.View()
+            disabled_btn = discord.ui.Button(
+                label="✅ Verified",
+                style=discord.ButtonStyle.green,
+                disabled=True
+            )
+            disabled_view.add_item(disabled_btn)
+            await prompt_msg.edit(view=disabled_view)
+        except Exception:
+            pass
+
+# Track channels we've already processed to prevent duplicate verification embeds
+_processed_channel_ids = set()
 
 @bot.event
 async def on_guild_channel_create(channel):
     if not isinstance(channel, discord.TextChannel):
         return
-    if not channel.category or channel.category.id != PAYMENT_TICKET_CATEGORY_ID:
+
+    # ── FIX: Deduplication guard — skip if we already processed this channel ──
+    if channel.id in _processed_channel_ids:
         return
-    # Wait briefly for Discord to set up permissions
-    await asyncio.sleep(1)
-    # Find who opened the ticket (first non-bot member with read access)
-    opener = None
-    for target, overwrite in channel.overwrites.items():
-        if isinstance(target, discord.Member) and not target.bot:
-            if overwrite.read_messages:
+    _processed_channel_ids.add(channel.id)
+    # Auto-clean old entries so the set doesn't grow forever
+    if len(_processed_channel_ids) > 500:
+        _processed_channel_ids.clear()
+        _processed_channel_ids.add(channel.id)
+
+    await asyncio.sleep(1.5)  # wait for Discord to set permissions
+
+    # ─── Payment ticket: just rename it ───────────────────────────────────
+    if channel.category and channel.category.id == get_config(channel.guild.id, "PAYMENT_TICKET_CATEGORY_ID"):
+        opener = None
+        for target, overwrite in channel.overwrites.items():
+            if isinstance(target, discord.Member) and not target.bot and overwrite.read_messages:
                 opener = target
                 break
-    if opener:
-        new_name = f"payment-{opener.display_name[:80].lower().replace(' ', '-')}"
+        if opener:
+            new_name = f"payment-{opener.display_name[:80].lower().replace(' ', '-')}"
+            try:
+                await channel.edit(name=new_name)
+                logging.info(f"Renamed payment ticket to {new_name}")
+            except Exception as e:
+                logging.error(f"Could not rename ticket: {e}")
+        return
+
+    # ─── Application/verify ticket: auto-verify flow ──────────────────────
+    # Work for ALL ticket categories AND even tickets created outside them
+    # (user asked it to work regardless of category)
+    opener = None
+    for target, overwrite in channel.overwrites.items():
+        if isinstance(target, discord.Member) and not target.bot and overwrite.read_messages:
+            opener = target
+            break
+
+    if not opener:
+        return  # can't find the ticket owner, bail
+
+    # Don't process payment tickets again
+    if channel.category and channel.category.id == get_config(channel.guild.id, "PAYMENT_TICKET_CATEGORY_ID"):
+        return
+
+    # Send verification prompt with a button that opens the Modal form
+    embed = discord.Embed(
+        title="👋 Welcome! Let's get you verified.",
+        description=(
+            f"Hey {opener.mention}! 🎉\n\n"
+            f"To complete your application, click the **Submit Verification Info** button below and fill in both links.\n\n"
+            f"**1️⃣ Reddit Profile Link**\n"
+            f"Your Reddit profile URL — e.g.\n`https://www.reddit.com/user/YourUsername`\n\n"
+            f"**2️⃣ CQS Test Result Link**\n"
+            f"CQS (Contributor Quality Score) is a Reddit internal score. Here's how to get it:\n\n"
+            f"┣ Go to 👉 **https://www.reddit.com/r/WhatIsMyCQS**\n"
+            f"┣ Click **New Post** and type exactly: `what is my cqs`\n"
+            f"┣ AutoModerator will **reply to your post** with your CQS tier\n"
+            f"┗ Copy the **link to your post** and paste it in the form\n\n"
+            f"✅ **Accepted tiers:** Moderate, High, Highest\n"
+            f"❌ **Rejected tiers:** Low, Lowest\n\n"
+            f"Once you submit, the bot verifies you automatically! 🤖"
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="Make sure your Reddit account is not private/suspended, and that AutoMod has replied to your CQS post before submitting.")
+    view = VerifyPromptView(channel=channel, opener=opener)
+    try:
+        # Removed raw ping to prevent anti-spam trigger if many tickets are opened rapidly
+        prompt_msg = await channel.send(embed=embed, view=view)
+    except Exception as e:
+        logging.error(f"Could not send verification prompt: {e}")
+
+
+# Track recently processed message IDs to prevent double responses
+_processed_msg_ids = deque(maxlen=200)
+
+@bot.event
+async def on_message_delete(m: discord.Message):
+    # Enforce undeletable logs in GIVE_LOG_CHANNEL_ID
+    if m.guild and m.channel.id == get_config(m.guild.id, "GIVE_LOG_CHANNEL_ID"):
+        deleter = m.author.mention  # Default to the author if no audit log is found
+        await asyncio.sleep(1) # Give Discord a second to generate the audit log
         try:
-            await channel.edit(name=new_name)
-            logging.info(f"Renamed payment ticket to {new_name}")
-        except Exception as e:
-            logging.error(f"Could not rename ticket: {e}")
+            # Check audit logs to see if an Admin deleted it
+            async for entry in m.guild.audit_logs(action=discord.AuditLogAction.message_delete, limit=3):
+                if entry.target.id == m.author.id and entry.extra.channel.id == m.channel.id:
+                    deleter = entry.user.mention
+                    break
+        except Exception:
+            pass
+
+        # Repost ANY deleted message (even from users) - removed @everyone spam
+        content_prefix = f"🚨 **[RESTORED]** {deleter} tried to delete a message from {m.author.mention}:\n"
+        await m.channel.send(content=content_prefix + m.content, embeds=m.embeds)
 
 @bot.event
 async def on_message(m: discord.Message):
     if m.author.bot: 
         return
+
+    # ── FIX: Skip if we already processed this exact message ──
+    if m.id in _processed_msg_ids:
+        return
+    _processed_msg_ids.append(m.id)
 
     # ── Owner aura request handlers — must be FIRST before any other logic ──
     OWNER_ID = 992008865656868946
@@ -2567,18 +3241,37 @@ async def on_message(m: discord.Message):
     global last_chatter_id
     text = m.content.lower().strip()
         
+    _chat_cooldowns = getattr(bot, "_chat_cooldowns", {})
+    if not hasattr(bot, "_chat_cooldowns"):
+        bot._chat_cooldowns = _chat_cooldowns
+
     _yo_triggers = {"yo", "yoo", "yooo", "hi", "hello", "wsg", "wassup", "konnichiwa", "konnichiha", "hola", "bonjour", "salut", "ciao", "hallo", "namaste", "salam", "merhaba", "oi", "ola", "hei", "hej", "привет", "안녕", "こんにちは"}
     _gm_triggers = {"gm", "good morning", "good mrng", "gmorning", "subah", "subh", "subha", "good mng"}
     _gn_triggers = {"gn", "good night", "good nite", "goodnight", "raat", "sone ja", "so ja", "sojaon"}
-    if text in _gm_triggers:
-        reply = await quick_ai(f"{m.author.display_name} said good morning in the server. Reply with a chill personalized good morning. Match language. 1 sentence.", max_tokens=150)
-        await m.channel.send(reply if reply else f"Good morning {m.author.mention} 👋")
-    elif text in _gn_triggers:
-        reply = await quick_ai(f"{m.author.display_name} said good night in the server. Reply with a chill good night message. Match language. 1 sentence.", max_tokens=150)
-        await m.channel.send(reply if reply else f"Good night {m.author.mention} 🌙")
-    elif text in _yo_triggers:
-        yo_reply = await quick_ai(f"{m.author.display_name} just said '{m.content}' in the server chat. Give a short, fun greeting back. Match their language. Max 1 sentence.", max_tokens=160)
-        await m.channel.send(yo_reply if yo_reply else yo_bag.get_next())
+    
+    # Check cooldown before processing AI replies to avoid rate limit bans
+    if text in _gm_triggers or text in _gn_triggers or text in _yo_triggers:
+        # Check Premium status
+        if not m.guild or (str(m.guild.id) not in premium_guilds and m.guild.owner_id != 992008865656868946):
+            return  # Don't trigger auto-replies in free servers
+            
+        now_ts = time.time()
+        if now_ts - _chat_cooldowns.get("global_chat_trigger", 0) < 10:
+            return  # On cooldown, ignore the trigger
+        _chat_cooldowns["global_chat_trigger"] = now_ts
+        
+        if text in _gm_triggers:
+            reply = await quick_ai(f"{m.author.display_name} said good morning in the server. Reply with a chill personalized good morning. Match language. 1 sentence.", max_tokens=150)
+            await m.channel.send(reply if reply else f"Good morning {m.author.mention} 👋")
+            return
+        elif text in _gn_triggers:
+            reply = await quick_ai(f"{m.author.display_name} said good night in the server. Reply with a chill good night message. Match language. 1 sentence.", max_tokens=150)
+            await m.channel.send(reply if reply else f"Good night {m.author.mention} 🌙")
+            return
+        elif text in _yo_triggers:
+            yo_reply = await quick_ai(f"{m.author.display_name} just said '{m.content}' in the server chat. Give a short, fun greeting back. Match their language. Max 1 sentence.", max_tokens=160)
+            await m.channel.send(yo_reply if yo_reply else yo_bag.get_next())
+            return
 
     # Gemini AI — respond when bot is @mentioned
     if bot.user in m.mentions:
@@ -2652,44 +3345,53 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
             reply = _re.sub(r'<[A-Z]:[a-zA-Z0-9_]+:\d+>', '', reply)
             reply = reply.strip()
             if reply:
-                await m.reply(reply)
+                for i in range(0, len(reply), 2000):
+                    await m.reply(reply[i:i+2000])
                 asyncio.create_task(_extract_memory(m.author.id, m.author.display_name, question, reply))
                 # --- BOT STEALS THE PUZZLE REWARD ---
                 if active_puzzle["question"] and not active_puzzle["solved"]:
-                    ans = str(active_puzzle["answer"]).lower()
+                    ans_raw = str(active_puzzle["answer"]).lower()
+                    ans_clean = "".join(c for c in ans_raw if c.isalnum() or c.isspace()).strip()
                     # Strip punctuation from the bot's reply so we can check it cleanly
                     clean_reply = "".join(c for c in reply.lower() if c.isalnum() or c.isspace())
                     
                     # Check if the exact answer is inside the bot's reply
-                    if f" {ans} " in f" {clean_reply} " or ans == clean_reply.replace(" ", ""):
+                    if f" {ans_clean} " in f" {clean_reply} " or ans_clean.replace(" ", "") == clean_reply.replace(" ", ""):
                         active_puzzle["solved"] = True
                         bot_bank["balance"] += 50
                         save_data()
                         
                         await m.channel.send(f"🤖 **Hold up... I just solved my own puzzle!**\nI'm stealing the **50 Aura** for my casino bank! 🤑\n> ✅ Answer: **{active_puzzle['answer'].title()}**")
         return
-    if any(w in text for w in BAD_WORDS):
-        try: 
-            await m.delete()
-        except: 
-            pass
-        return await m.channel.send(f"{m.author.mention}, watch your language. {E_WARN}", delete_after=5)
 
-    if m.channel.id in (CHAT_CHANNEL_ID, CHAT_CHANNEL_ID_2):
+    # Update last_message_times if they talk in main chat or task channels to prevent aura expiry
+    if m.channel.id in (get_config(m.guild.id if m.guild else 0, "CHAT_CHANNEL_ID"), CHAT_CHANNEL_ID_2, 1518207367941193972, 1518207420487172156, 1518207461650202755):
+        last_message_times[str(m.author.id)] = time.time()
+
+    if m.channel.id in (get_config(m.guild.id if m.guild else 0, "CHAT_CHANNEL_ID"), CHAT_CHANNEL_ID_2):
         uid = m.author.id
         
-        # This makes sure they ONLY stay alive if they talk in the main chat!
-        last_message_times[str(uid)] = time.time()
+        # --- SENTIENT LURKER MODE ---
+        if not m.content.startswith('/') and len(text) > 15 and bot.user not in m.mentions:
+            # Check Premium status
+            if m.guild and (str(m.guild.id) in premium_guilds or m.guild.owner_id == 992008865656868946):
+                import random
+                if random.random() < 0.01: # 1% chance
+                    interject_prompt = f"You are the sarcastic bot of this Discord server. You are lurking. The user {m.author.display_name} just said: '{m.content}'. Jump in uninvited with a witty, funny, or sarcastic 1-sentence comment. Act like you were eavesdropping."
+                    reply = await quick_ai(interject_prompt, max_tokens=150)
+                    if reply:
+                        await m.channel.send(reply)
         
         # Puzzle answer check
         if active_puzzle["question"] and not active_puzzle["solved"]:
-            correct_ans = str(active_puzzle["answer"]).lower()
+            correct_ans_raw = str(active_puzzle["answer"]).lower()
+            correct_ans_clean = "".join(c for c in correct_ans_raw if c.isalnum() or c.isspace()).strip()
             
             # Strip punctuation from the user's message so we can check it cleanly
             clean_text = "".join(c for c in text.lower() if c.isalnum() or c.isspace())
             
             # Check if the exact answer is anywhere inside their sentence
-            if f" {correct_ans} " in f" {clean_text} " or correct_ans == clean_text.replace(" ", ""):
+            if f" {correct_ans_clean} " in f" {clean_text} " or correct_ans_clean.replace(" ", "") == clean_text.replace(" ", ""):
                 active_puzzle["solved"] = True
                 old_b = balance[uid]
                 balance[uid] += 50
@@ -2703,8 +3405,9 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
                 hype_msg = hype if hype else f"**{label} SOLVED!** 🎉"
                 await m.channel.send(f"{hype_msg} {m.author.mention} wins **50 Aura**!\n> ✅ Answer: **{active_puzzle['answer'].title()}**")
 
-        found_hard = next((egg for egg in hard_eggs if egg in text), None)
-        found_easy = next((egg for egg in easy_eggs if egg in text), None)
+        import re
+        found_hard = next((egg for egg in hard_eggs if re.search(r'\b' + re.escape(egg) + r'\b', text)), None)
+        found_easy = next((egg for egg in easy_eggs if re.search(r'\b' + re.escape(egg) + r'\b', text)), None)
         
         if found_hard and found_hard not in claimed_easter_eggs:
             claimed_easter_eggs.append(found_hard)
@@ -2740,6 +3443,9 @@ Only reply YES if it's a clear direct request like "give me aura", "can I have s
 
 
 # ================== BACKGROUND TASKS ==================
+
+# dm_brokies_task was removed because mass DMing users automatically every day violates Discord's Anti-Spam policy.
+
 VC_MILESTONES = [10, 50, 100, 250, 500, 1000]
 # ==========================================
 # INACTIVITY WIPER (THE GRIM REAPER)
@@ -2773,23 +3479,25 @@ async def aura_expiry_task():
     
     # --- PUBLIC ANNOUNCEMENT WITH PINGS ---
     if wiped_uids:
-        channel = bot.get_channel(CHAT_CHANNEL_ID) 
+        channel = bot.get_channel(get_config(guild.id, "CHAT_CHANNEL_ID")) if "guild" in locals() and guild else GlobalChannelProxy("CHAT_CHANNEL_ID") 
         if channel:
-            # Split the victims into groups of 40 so Discord doesn't block the message for being too long!
-            for i in range(0, len(wiped_uids), 40):
-                chunk = wiped_uids[i:i + 40]
-                
-                # This creates the raw text string that actually triggers the ping notification
-                ping_string = " ".join([f"<@{u}>" for u in chunk])
-                
-                embed = discord.Embed(
-                    title="💀 The Grim Reaper", 
-                    description=f"Swept **{len(chunk)}** inactive accounts for 7 days of silence.\nAll their Aura has been burned to ash. Say something in chat to stay alive!", 
-                    color=discord.Color.dark_theme()
-                )
-                
-                # Send the pings outside the embed, but attach the cool embed below it
-                await channel.send(content=ping_string, embed=embed)
+            embed = discord.Embed(
+                title="💀 The Grim Reaper", 
+                description=f"Swept **{len(wiped_uids)}** inactive accounts for 7 days of silence.\nAll their Aura has been burned to ash. Say something in chat to stay alive!", 
+                color=discord.Color.dark_theme()
+            )
+            # Just send the cool embed without mass-pinging users to avoid Discord anti-spam flags.
+            await channel.send(embed=embed)
+
+@tasks.loop(minutes=1)
+async def withdrawal_checker_loop():
+    global withdrawal_open_until
+    if withdrawal_open_until and datetime.datetime.now(IST) >= withdrawal_open_until:
+        withdrawal_open_until = None
+        save_data()
+        announce = GlobalChannelProxy("DAILY_ANNOUNCE_CHANNEL_ID")
+        if announce:
+            await announce.send(embed=discord.Embed(title="🔒 Withdrawals Closed", description="The withdrawal window has ended.", color=discord.Color.red()))
 
 @tasks.loop(minutes=1)
 async def vc_reward_task():
@@ -2822,7 +3530,7 @@ async def vc_reward_task():
                             vc_milestones_reached[uid_str].append(hours)
                             balance[uid] += 100
                             
-                            ch = bot.get_channel(CHAT_CHANNEL_ID)
+                            ch = bot.get_channel(get_config(guild.id, "CHAT_CHANNEL_ID")) if "guild" in locals() and guild else GlobalChannelProxy("CHAT_CHANNEL_ID")
                             if ch:
                                 await ch.send(
                                     embed=discord.Embed(
@@ -2837,7 +3545,6 @@ async def vc_reward_task():
 async def server_mood_tracker():
     global last_mood_check
     now = datetime.datetime.now(IST)
-    # Only check once per day, randomly between 6pm-9pm IST
     if not (18 <= now.hour < 21):
         return
     today = now.date().isoformat()
@@ -2846,24 +3553,31 @@ async def server_mood_tracker():
     if random.random() > 0.3:
         return
     last_mood_check = today
-    ch = bot.get_channel(CHAT_CHANNEL_ID)
-    if not ch:
-        return
-    # Collect recent messages from all non-staff channels
-    all_msgs = []
-    for cid, log in channel_chat_log.items():
-        c = bot.get_channel(cid)
-        if c and (not c.category or c.category.name != "Staff Area"):
-            all_msgs.extend(list(log)[-10:])
-    if len(all_msgs) < 5:
-        return
-    sample = "\n".join(all_msgs[-30:])
-    mood = await quick_ai(
-        f"Based on these recent Discord server messages, describe the server vibe/mood in one punchy sentence. Use emojis. Be fun and accurate.\n\nMessages:\n{sample}",
-        max_tokens=160
-    )
-    if mood:
-        await ch.send(f"📡 **Server Mood Check:** {mood}")
+    
+    for guild in bot.guilds:
+        if str(guild.id) not in premium_guilds and guild.owner_id != 992008865656868946:
+            continue
+            
+        ch_id = get_config(guild.id, "CHAT_CHANNEL_ID")
+        ch = bot.get_channel(ch_id) if ch_id else None
+        if not ch:
+            continue
+            
+        all_msgs = []
+        for cid, log in channel_chat_log.items():
+            c = bot.get_channel(cid)
+            if c and c.guild.id == guild.id and (not c.category or c.category.name != "Staff Area"):
+                all_msgs.extend(list(log)[-10:])
+        if len(all_msgs) < 5:
+            continue
+            
+        sample = "\n".join(all_msgs[-30:])
+        mood = await quick_ai(
+            f"Based on these recent Discord server messages, describe the server vibe/mood in one punchy sentence. Use emojis. Be fun and accurate.\n\nMessages:\n{sample}",
+            max_tokens=160
+        )
+        if mood:
+            await ch.send(f"📡 **Server Mood Check:** {mood}")
 
 
 @tasks.loop(minutes=5)
@@ -2929,8 +3643,6 @@ async def market_fluctuation():
             shock = random.choice([-0.20, -0.15, 0.11, 0.12, 0.08])
             change += shock
             logging.info(f"Shock event on {coin}: {shock:+.0%}")
-            if random.random() < 0.10:  # 10% chance to comment
-                asyncio.create_task(_shock_comment(coin, shock))
 
         # Skip delisted coins entirely
         if coin in delisted_coins:
@@ -2989,7 +3701,7 @@ async def market_fluctuation():
             stock_history[coin] = []
             save_data()
             # Announce in chat channel
-            ch = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
+            ch = GlobalChannelProxy("DAILY_ANNOUNCE_CHANNEL_ID")
             if ch:
                     # 1. Get the AI response first
                     ai_news = await quick_ai(f"Write a dramatic breaking news style announcement: the crypto coin {coin} just crashed to 0 and got delisted! {len(wiped)} holders lost their shares. They got 10% back as liquidation. It will relist in {relist_delay // 3600} hours. Keep it fun and dramatic. Max 3 sentences.", max_tokens=120)
@@ -3029,7 +3741,7 @@ async def market_fluctuation():
             stock_history[coin] = [relist_price] * 10
             del delisted_coins[coin]
             save_data()
-            ch = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
+            ch = GlobalChannelProxy("DAILY_ANNOUNCE_CHANNEL_ID")
             if ch:
                 embed = discord.Embed(
                     title="🔔 COIN RELISTED",
@@ -3082,7 +3794,7 @@ async def daily_hot_take():
     if random.random() > 0.15:
         return
     last_hot_take_date = today
-    ch = bot.get_channel(CHAT_CHANNEL_ID)
+    ch = bot.get_channel(get_config(guild.id, "CHAT_CHANNEL_ID")) if "guild" in locals() and guild else GlobalChannelProxy("CHAT_CHANNEL_ID")
     if not ch:
         return
     stock_prices = ", ".join(f"{c}: {v:.1f} Aura" for c, v in stocks.items())
@@ -3101,7 +3813,7 @@ async def weekly_recap_task():
     if now.weekday() != 6:  # 6 = Sunday. If it's not Sunday, go back to sleep.
         return
         
-    ch = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
+    ch = GlobalChannelProxy("DAILY_ANNOUNCE_CHANNEL_ID")
     if not ch:
         return
 
@@ -3132,7 +3844,9 @@ async def weekly_recap_task():
         f"Lowest priced stock: {worst_stock} at {stocks.get(worst_stock, 0):.1f} Aura. "
         f"Be funny, engaging, like a sports commentator. 3-4 sentences max."
     )
-    recap = await quick_ai(prompt, max_tokens=600)
+    recap = await quick_ai(prompt, max_tokens=2000)
+    if recap and len(recap) > 4000:
+        recap = recap[:4000] + "..."
 
     # 5. Build and Send the Embed
     embed = discord.Embed(
@@ -3199,10 +3913,6 @@ async def science_fact_dropper():
         return
 
     last_science_fact_date = today
-    channel = bot.get_channel(CHAT_CHANNEL_ID)
-    if not channel:
-        return
-
     fact = await quick_ai("Share one fascinating science, space, biology or physics fact. Make it mind-blowing and engaging. Start directly with the fact, no intro. 2 sentences max. ALWAYS finish the sentence completely.", max_tokens=200)
     if not fact:
         fact = random.choice(SCIENCE_FACTS)
@@ -3212,7 +3922,16 @@ async def science_fact_dropper():
         color=discord.Color.teal()
     )
     embed.set_footer(text="Mind blown? Drop a 🤯 below!")
-    await channel.send(embed=embed)
+    
+    for guild in bot.guilds:
+        if str(guild.id) not in premium_guilds and guild.owner_id != 992008865656868946:
+            continue
+        ch_id = get_config(guild.id, "CHAT_CHANNEL_ID")
+        ch = bot.get_channel(ch_id) if ch_id else None
+        if ch:
+            try:
+                await ch.send(embed=embed)
+            except: pass
 
 @tasks.loop(minutes=20)
 async def daily_puzzle_scheduler():
@@ -3262,7 +3981,7 @@ async def daily_puzzle_scheduler():
     if slot is None or random.random() > chance:
         return
 
-    channel = bot.get_channel(CHAT_CHANNEL_ID)
+    channel = bot.get_channel(get_config(guild.id, "CHAT_CHANNEL_ID")) if "guild" in locals() and guild else GlobalChannelProxy("CHAT_CHANNEL_ID")
     if not channel:
         return
 
@@ -3313,72 +4032,75 @@ async def daily_puzzle_scheduler():
     
 @tasks.loop(hours=24)    
 async def autokick_check():
-    cfg = autokick_cfg
-    if not cfg.get("role_id"): 
-        return
-        
-    warn_channel = bot.get_channel(AUTOKICK_WARN_CHANNEL_ID)
-    if not warn_channel: 
-        return
-        
-    guild = warn_channel.guild
-    role = guild.get_role(cfg["role_id"])
-    if not role: 
-        return
-        
-    days_limit = cfg["days"]
-    half_days = cfg["days"] / 2.0
     now = time.time()
-    to_warn = []
-    to_kick = []
     
-    for member in role.members:
-        if member.bot: 
+    for guild in bot.guilds:
+        guild_id_str = str(guild.id)
+        # Fallback to global cfg for backwards compatibility if guild config not found
+        cfg = autokick_cfg.get(guild_id_str) or (autokick_cfg if "role_id" in autokick_cfg else None)
+        if not cfg or not cfg.get("role_id"):
             continue
             
-        uid_str = str(member.id)
-        if not user_timers.get(uid_str):
-            user_timers[uid_str] = now
+        days_limit = cfg["days"]
+        half_days = cfg["days"] / 2.0
+            
+        warn_channel_id = get_config(guild.id, "AUTOKICK_WARN_CHANNEL_ID")
+        warn_channel = bot.get_channel(warn_channel_id) if warn_channel_id else None
+        
+        role = guild.get_role(cfg["role_id"])
+        if not role: 
+            continue
+            
+        to_warn = []
+        to_kick = []
+        
+        for member in role.members:
+            if member.bot: 
+                continue
+                
+            uid_str = str(member.id)
+            if not user_timers.get(uid_str):
+                user_timers[uid_str] = now
+                save_data()
+                continue
+                
+            elapsed_days = (now - user_timers[uid_str]) / 86400.0
+            
+            if elapsed_days >= days_limit: 
+                to_kick.append(member)
+            elif elapsed_days >= half_days and uid_str not in cfg.get("warned", []):
+                to_warn.append(member)
+                if "warned" not in cfg: 
+                    cfg["warned"] = []
+                cfg["warned"].append(uid_str)
+            
+        if to_warn or to_kick: 
             save_data()
-            continue
             
-        elapsed_days = (now - user_timers[uid_str]) / 86400.0
-        
-        if elapsed_days >= days_limit: 
-            to_kick.append(member)
-        elif elapsed_days >= half_days and uid_str not in cfg.get("warned", []):
-            to_warn.append(member)
-            if "warned" not in cfg: 
-                cfg["warned"] = []
-            cfg["warned"].append(uid_str)
+        if to_kick:
+            kicked_names = []
+            for m in to_kick:
+                try: 
+                    await m.send(f"You have been kicked from **{guild.name}** as your {days_limit}-day time limit has expired.")
+                except: 
+                    pass
+                    
+                try: 
+                    await m.kick(reason=f"Time limit of {days_limit} days expired")
+                    kicked_names.append(f"**{m.display_name}**")
+                    if str(m.id) in cfg.get("warned", []): 
+                        cfg["warned"].remove(str(m.id))
+                    if str(m.id) in user_timers: 
+                        del user_timers[str(m.id)]
+                except: 
+                    pass
+                    
+            if kicked_names:
+                await warn_channel.send(embed=discord.Embed(title="👢 Users Auto-Kicked", description=f"The following users failed to open a ticket in time and were removed:\n{', '.join(kicked_names)}", color=discord.Color.red()))
             
-    if to_warn or to_kick: 
-        save_data()
-        
-    if to_kick:
-        kicked_names = []
-        for m in to_kick:
-            try: 
-                await m.send(f"You have been kicked from **{guild.name}** as your {days_limit}-day time limit has expired.")
-            except: 
-                pass
-                
-            try: 
-                await m.kick(reason=f"Time limit of {days_limit} days expired")
-                kicked_names.append(f"**{m.display_name}**")
-                if str(m.id) in cfg.get("warned", []): 
-                    cfg["warned"].remove(str(m.id))
-                if str(m.id) in user_timers: 
-                    del user_timers[str(m.id)]
-            except: 
-                pass
-                
-        if kicked_names:
-            await warn_channel.send(embed=discord.Embed(title="👢 Users Auto-Kicked", description=f"The following users failed to open a ticket in time and were removed:\n{', '.join(kicked_names)}", color=discord.Color.red()))
-        
-    if to_warn:
-        mentions = " ".join([m.mention for m in to_warn])
-        await warn_channel.send(content=mentions, embed=discord.Embed(title="⚠️ Time Limit Warning!", description=f"You are exactly halfway through your **{days_limit}-day** limit.\n\nPlease create a ticket or msg the issue in help channel <#{HELP_CHANNEL_ID}>, otherwise you will be automatically kicked.", color=discord.Color.orange()))
+        if to_warn:
+            mentions = " ".join([m.mention for m in to_warn])
+            await warn_channel.send(content=mentions, embed=discord.Embed(title="⚠️ Time Limit Warning!", description=f"You are exactly halfway through your **{days_limit}-day** limit.\n\nPlease create a ticket or msg the issue in help channel <#{get_config(guild.id, 'HELP_CHANNEL_ID')}>, otherwise you will be automatically kicked.", color=discord.Color.orange()))
 
 @tasks.loop(time=datetime.time(hour=0, minute=0, tzinfo=IST))
 async def midnight_birthday_check():
@@ -3389,16 +4111,16 @@ async def midnight_birthday_check():
     bot_bank["balance"] = 100
     save_data()
 
-    announce = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
+    announce = GlobalChannelProxy("DAILY_ANNOUNCE_CHANNEL_ID")
     if announce: 
         await announce.send(f"{E_PARTY} **A brand new day has begun!** Time to farm some positive Aura. Claim your `/daily` now! {E_VIBE}")
         
-    bday_channel = bot.get_channel(BIRTHDAY_CHANNEL_ID)
-    chat_channel = bot.get_channel(CHAT_CHANNEL_ID)
+    bday_channel = GlobalChannelProxy("BIRTHDAY_CHANNEL_ID")
+    chat_channel = GlobalChannelProxy("CHAT_CHANNEL_ID")
     guild = bday_channel.guild if bday_channel else None
     
     if bday_channel and guild:
-        role = guild.get_role(BIRTHDAY_ROLE_ID)
+        role = guild.get_role(get_config(guild.id, "BIRTHDAY_ROLE_ID"))
         celebrants = [uid for uid, bday in birthdays.items() if bday == today_bday_str] 
         
         if celebrants:
@@ -3428,10 +4150,10 @@ async def check_birthday_roles():
     expired = [uid for uid, exp in active_birthday_roles.items() if now > exp]
     
     if expired:
-        channel = bot.get_channel(BIRTHDAY_CHANNEL_ID)
+        channel = GlobalChannelProxy("BIRTHDAY_CHANNEL_ID")
         if channel:
             guild = channel.guild
-            role = guild.get_role(BIRTHDAY_ROLE_ID)
+            role = guild.get_role(get_config(guild.id, "BIRTHDAY_ROLE_ID"))
             if role:
                 for uid in expired:
                     member = guild.get_member(uid)
@@ -3465,7 +4187,7 @@ async def french_roulette(i: discord.Interaction, amount: int, bet_on: str):
     if balance[i.user.id] < amount: 
         return await i.response.send_message(f"Not enough Aura! Your balance is {balance[i.user.id]:,}", ephemeral=True)
 
-    high_roller = amount > 150  # guaranteed loss flag
+    high_roller = False
 
     bet_target = bet_on.lower().strip()
     valid_text_bets = ["red", "black", "even", "odd", "high", "low", "1st", "2nd", "3rd", "col1", "col2", "col3"]
@@ -3731,16 +4453,12 @@ async def open_withdrawals(i: discord.Interaction, hours: int):
         return await i.response.send_message("Please enter between 1 and 72 hours.", ephemeral=True)
     withdrawal_open_until = datetime.datetime.now(IST) + datetime.timedelta(hours=hours)
     closes_at = withdrawal_open_until.strftime("%d %b %Y %I:%M %p IST")
-    announce = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
+    announce = GlobalChannelProxy("DAILY_ANNOUNCE_CHANNEL_ID")
     embed = discord.Embed(title="💸 Withdrawals are OPEN!", description=f"You can now use `/withdraw` to cash out your Aura.\n\nWithdrawals close: **{closes_at}**", color=discord.Color.green())
     if announce:
         await announce.send(embed=embed)
+    save_data()
     await i.response.send_message(f"✅ Withdrawals opened for **{hours} hour(s)**. Closes at {closes_at}.", ephemeral=True)
-    await asyncio.sleep(hours * 3600)
-    if withdrawal_open_until and datetime.datetime.now(IST) >= withdrawal_open_until:
-        withdrawal_open_until = None
-        if announce:
-            await announce.send(embed=discord.Embed(title="🔒 Withdrawals Closed", description="The withdrawal window has ended.", color=discord.Color.red()))
 
 @bot.tree.command(name="close_withdrawals", description="Staff: Close withdrawals immediately")
 async def close_withdrawals(i: discord.Interaction):
@@ -3748,6 +4466,7 @@ async def close_withdrawals(i: discord.Interaction):
     if not is_staff(i.user):
         return await i.response.send_message("Staff only.", ephemeral=True)
     withdrawal_open_until = None
+    save_data()
     await i.response.send_message("🔒 Withdrawals closed.", ephemeral=True)
 
 @bot.tree.command(name="withdraw", description="Withdraw your Aura")
@@ -3772,7 +4491,7 @@ async def withdraw(i: discord.Interaction, amount: int, method: str, details: st
     if balance[uid] < amount: 
         return await i.response.send_message(f"Not enough Aura! Balance: {balance[uid]:,}", ephemeral=True)
         
-    payout_channel = bot.get_channel(PAYOUT_CHANNEL_ID)
+    payout_channel = bot.get_channel(get_config(interaction.guild.id if "interaction" in locals() else i.guild.id if "i" in locals() else 0, "PAYOUT_CHANNEL_ID"))
     if not payout_channel: 
         return await i.response.send_message("Payout channel not set.", ephemeral=True)
         
@@ -3975,7 +4694,7 @@ async def remove_aura(i: discord.Interaction, amount: int):
 
     await i.response.send_message(embed=discord.Embed(title="🔥 Aura Burned", description=f"You have permanently destroyed **{amount:,}** of your own Aura.", color=discord.Color.red()))
 
-    log_ch = bot.get_channel(GIVE_LOG_CHANNEL_ID)
+    log_ch = bot.get_channel(get_config(i.guild.id, "GIVE_LOG_CHANNEL_ID"))
     if log_ch:
         embed = discord.Embed(title="🔥 Aura Burned", color=discord.Color.dark_orange())
         embed.add_field(name="User", value=i.user.mention, inline=True)
@@ -3994,8 +4713,8 @@ async def gamble(i: discord.Interaction, amount: int, side: str):
     if amount <= 0 or balance[i.user.id] < amount: 
         return await i.response.send_message("Invalid bet!", ephemeral=True)
     
-    win_chance = 0 if amount > 150 else 20  # guaranteed loss for bets over 150
-    payout_multiplier = 0.90 
+    win_chance = 50
+    payout_multiplier = 0.95 
     
     if random.randint(1, 100) <= win_chance:
         outcome = side
@@ -4408,7 +5127,7 @@ async def invite_event_cmd(i: discord.Interaction, action: str):
     if not is_staff(i.user):
         return await i.response.send_message("Staff only.", ephemeral=True)
 
-    announce = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
+    announce = GlobalChannelProxy("DAILY_ANNOUNCE_CHANNEL_ID")
 
     if action == "start":
         if invite_event_active:
@@ -4496,7 +5215,7 @@ async def close_all_tickets(i: discord.Interaction):
     if not is_staff(i.user):
         return await i.response.send_message("Staff only.", ephemeral=True)
     await i.response.defer(ephemeral=True)
-    category = i.guild.get_channel(1448805721071292661)
+    category = i.guild.get_channel(get_config(i.guild.id, 'PAYMENT_TICKET_CATEGORY_ID'))
     if not category or not isinstance(category, discord.CategoryChannel):
         return await i.followup.send("Payment category not found.", ephemeral=True)
     deleted = 0
@@ -4536,19 +5255,73 @@ async def add_user_to_current_channel(i: discord.Interaction, user: discord.Memb
 @bot.tree.command(name="roast", description="Roast someone (or yourself)")
 async def roast(i: discord.Interaction, user: discord.Member):
     await i.response.defer()
+    
+    target_bal = balance.get(user.id, 0)
+    target_streak = daily_streak.get(user.id, 0)
+    caller_bal = balance.get(i.user.id, 0)
+    
     if user.id == bot.user.id:
-        reply = await quick_ai(f"{i.user.display_name} tried to roast me, the bot. Roast them back harder. Funny, savage, short. 1-2 sentences. ALWAYS finish the sentence completely.", max_tokens=150)
+        reply = await quick_ai(f"{i.user.display_name} tried to roast me, the bot. Roast them back harder. Their balance is {caller_bal} Aura. Make it funny, savage, short. 1-2 sentences. ALWAYS finish the sentence completely.", max_tokens=150)
         await i.followup.send(f"{i.user.mention} {reply if reply else 'Nice try 😂'}")
     elif user.id == i.user.id:
-        reply = await quick_ai(f"Write a funny self-roast for someone named {i.user.display_name}. Short, savage but fun. 1-2 sentences. ALWAYS finish the sentence completely.", max_tokens=150)
+        reply = await quick_ai(f"Write a funny self-roast for someone named {i.user.display_name}. Their server balance is {target_bal} Aura and their daily streak is {target_streak}. Short, savage but fun. 1-2 sentences. ALWAYS finish the sentence completely.", max_tokens=150)
         await i.followup.send(f"{i.user.mention} {reply if reply else roast_bag.get_next()}")
     else:
-        reply = await quick_ai(f"Roast a Discord user named {user.display_name}. Requested by {i.user.display_name}. Funny, creative, not offensive. 1-2 sentences. ALWAYS finish the sentence completely.", max_tokens=150)
+        reply = await quick_ai(f"Roast a Discord user named {user.display_name}. Requested by {i.user.display_name}. The target's balance is {target_bal} Aura and daily streak is {target_streak}. The requester's balance is {caller_bal} Aura. Make it funny, creative, not offensive. 1-2 sentences. ALWAYS finish the sentence completely.", max_tokens=150)
         await i.followup.send(f"{user.mention} {reply if reply else roast_bag.get_next()}")
+
+@bot.tree.command(name="hype", description="Hype someone up based on their stats")
+async def hype_cmd(i: discord.Interaction, user: discord.Member):
+    await i.response.defer()
+    bal = balance.get(user.id, 0)
+    streak = daily_streak.get(user.id, 0)
+    reply = await quick_ai(f"Write a highly energetic, over-the-top hype message for a Discord user named {user.display_name}. Their server balance is {bal} Aura and their daily streak is {streak}. Make them sound like an absolute legend. 2 sentences max.", max_tokens=200)
+    await i.followup.send(f"{user.mention} {reply if reply else 'You are awesome!'}")
+
+@bot.tree.command(name="fortune", description="Get someone's daily Aura fortune")
+async def fortune_cmd(i: discord.Interaction, user: discord.Member = None):
+    await i.response.defer()
+    target_user = user if user else i.user
+    bal = balance.get(target_user.id, 0)
+    reply = await quick_ai(f"Write a funny, sarcastic daily horoscope fortune for {target_user.display_name}. Their balance is {bal} Aura. Make up something absurd about their financial future in the server today. 2 sentences max.", max_tokens=200)
+    await i.followup.send(f"🔮 **{target_user.display_name}'s Fortune:**\n{reply if reply else 'The stars are silent today.'}")
+
+@bot.tree.command(name="meme", description="Generate an AI image/meme")
+async def meme_cmd(i: discord.Interaction, prompt: str):
+    await i.response.defer()
+    import io
+    from google.genai import types
+    
+    enhanced = await quick_ai(f"The user wants an image of '{prompt}'. Enhance this into a highly detailed, descriptive 1-sentence prompt for an AI image generator. Do not include any intro/outro text, just the prompt.", max_tokens=150)
+    
+    try:
+        response = await vertex_client.aio.models.generate_images(
+            model='imagen-3.0-generate-001',
+            prompt=enhanced or prompt,
+            config=types.GenerateImagesConfig(
+                number_of_images=1,
+                output_mime_type="image/jpeg",
+                aspect_ratio="1:1"
+            )
+        )
+        
+        if response.generated_images:
+            image_bytes = response.generated_images[0].image.image_bytes
+            file = discord.File(io.BytesIO(image_bytes), filename="meme.jpeg")
+            
+            embed = discord.Embed(title=f"🎨 {prompt}", description=f"*Generated Prompt: {enhanced}*" if enhanced else "", color=discord.Color.purple())
+            embed.set_image(url="attachment://meme.jpeg")
+            embed.set_footer(text=f"Requested by {i.user.display_name}")
+            
+            await i.followup.send(embed=embed, file=file)
+        else:
+            await i.followup.send("❌ The image generator returned no image. Please try a different prompt.")
+    except Exception as e:
+        await i.followup.send(f"❌ Error generating image: {e}")
 
 @bot.tree.command(name="confess", description="Submit an anonymous confession")
 async def confess(i: discord.Interaction, message: str):
-    channel = bot.get_channel(CONFESSION_CHANNEL_ID)
+    channel = bot.get_channel(get_config(i.guild.id, "CONFESSION_CHANNEL_ID"))
     if not channel:
         return await i.response.send_message("Confession channel not found! Tell staff to check the config.", ephemeral=True)
         
@@ -4699,7 +5472,7 @@ async def give(i: discord.Interaction, user: discord.Member, amount: int):
 
     await i.response.send_message(f"Gave **{amount:,}** Aura to {user.mention}.")
 
-    log_ch = bot.get_channel(GIVE_LOG_CHANNEL_ID)
+    log_ch = bot.get_channel(get_config(i.guild.id, "GIVE_LOG_CHANNEL_ID"))
     if log_ch:
         embed = discord.Embed(title="💸 Aura Given", color=discord.Color.green())
         embed.add_field(name="Staff", value=i.user.mention, inline=True)
@@ -4725,7 +5498,7 @@ async def take(i: discord.Interaction, user: discord.Member, amount: int):
 
     await i.response.send_message(f"Seized **{amount:,}** Aura from {user.mention} and added it to your account! 💰")
 
-    log_ch = bot.get_channel(GIVE_LOG_CHANNEL_ID)
+    log_ch = bot.get_channel(get_config(i.guild.id, "GIVE_LOG_CHANNEL_ID"))
     if log_ch:
         embed = discord.Embed(title="💰 Aura Taken", color=discord.Color.red())
         embed.add_field(name="Staff", value=i.user.mention, inline=True)
@@ -4757,18 +5530,80 @@ async def ban_user(i: discord.Interaction, user: discord.Member, reason: str = "
             await user.send(embed=embed_dm)
         except Exception:
             pass  # DMs closed, continue anyway
-        await user.ban(reason=f"Banned by {i.user.display_name} - {reason}", delete_message_days=delete_history)
+        await user.ban(reason=f"Banned by {i.user.display_name} - {reason}", delete_message_seconds=delete_history * 86400)
         await i.response.send_message(embed=discord.Embed(title="🔨 User Banned", description=f"**User:** {user.mention}\n**Reason:** {reason}\n**Deleted Msgs:** {delete_history} days", color=discord.Color.red()))
     except discord.Forbidden: 
         await i.response.send_message("❌ I do not have permission to ban this user.", ephemeral=True)
         
+
+
+@bot.tree.command(name="ai_prompt", description="Set a custom personality/prompt for the AI in this server.")
+@app_commands.describe(prompt_text="The base instructions for how the bot should behave (Leave blank to reset to default)")
+async def ai_prompt_cmd(i: discord.Interaction, prompt_text: str = None):
+    if not i.user.guild_permissions.administrator and i.user.id != 992008865656868946:
+        return await i.response.send_message("❌ You must be an Administrator to change the AI prompt.", ephemeral=True)
+        
+    if str(i.guild.id) not in server_configs:
+        server_configs[str(i.guild.id)] = {}
+        
+    if not prompt_text:
+        # Reset to default
+        if "AI_PROMPT" in server_configs[str(i.guild.id)]:
+            del server_configs[str(i.guild.id)]["AI_PROMPT"]
+            save_data()
+        return await i.response.send_message("✅ AI Prompt reset to the global default.", ephemeral=True)
+        
+    server_configs[str(i.guild.id)]["AI_PROMPT"] = prompt_text
+    save_data()
+    
+    await i.response.send_message(f"✅ Custom AI Prompt set successfully! The bot will now act like this:\n\n`{prompt_text}`", ephemeral=True)
+
+@bot.tree.command(name="premium", description="Owner Only: Manage Premium Servers")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Add Server", value="add"), 
+    app_commands.Choice(name="Remove Server", value="remove"),
+    app_commands.Choice(name="List Servers", value="list")
+])
+async def premium_cmd(i: discord.Interaction, action: str, guild_id: str = None):
+    # Only the bot owner can use this (hardcoded owner ID)
+    if i.user.id != 992008865656868946:
+        return await i.response.send_message("❌ This command is restricted to the Bot Owner.", ephemeral=True)
+        
+    if action == "list":
+        if not premium_guilds:
+            return await i.response.send_message("No premium servers currently.", ephemeral=True)
+        servers = []
+        for gid in premium_guilds:
+            g = bot.get_guild(int(gid))
+            servers.append(f"{g.name if g else 'Unknown'} (`{gid}`)")
+        return await i.response.send_message("💎 **Premium Servers:**\n" + "\n".join(servers), ephemeral=True)
+        
+    if not guild_id:
+        return await i.response.send_message("❌ You must provide a guild_id to add or remove.", ephemeral=True)
+        
+    if action == "add":
+        if guild_id not in premium_guilds:
+            premium_guilds.append(guild_id)
+            save_data()
+            await i.response.send_message(f"✅ Added `{guild_id}` to Premium Servers!", ephemeral=True)
+        else:
+            await i.response.send_message(f"`{guild_id}` is already premium.", ephemeral=True)
+            
+    elif action == "remove":
+        if guild_id in premium_guilds:
+            premium_guilds.remove(guild_id)
+            save_data()
+            await i.response.send_message(f"✅ Removed `{guild_id}` from Premium Servers.", ephemeral=True)
+        else:
+            await i.response.send_message(f"`{guild_id}` is not premium.", ephemeral=True)
+
 @bot.tree.command(name="force_market", description="Admin Only: Secretly nudge a coin's price towards a target over time")
 @app_commands.choices(coin=[app_commands.Choice(name=c, value=c) for c in DEFAULT_STOCKS.keys()])
 @app_commands.default_permissions(administrator=True) # Hides it from regular users in the menu
 async def force_market(i: discord.Interaction, coin: str, target_price: float):
     # 1. Strict Role Check (Only this exact Role ID can pass)
     ADMIN_ROLE_ID = 1448719741756768308
-    has_admin_role = any(role.id == ADMIN_ROLE_ID for role in i.user.roles)
+    has_admin_role = any(role.id == get_config(i.guild.id, "ADMIN_ROLE_ID") for role in i.user.roles)
     
     if not has_admin_role:
         return await i.response.send_message("🛑 You do not have the required Admin role to use this command.", ephemeral=True)
@@ -4848,7 +5683,7 @@ async def egg_add(i: discord.Interaction, tier: str, phrase: str):
         
     save_data()
     
-    chat_channel = bot.get_channel(CHAT_CHANNEL_ID)
+    chat_channel = GlobalChannelProxy("CHAT_CHANNEL_ID")
     if chat_channel: 
         await chat_channel.send(embed=discord.Embed(title="🥚 New Easter Egg Hidden!", description=f"A new **{tier.title()}** Easter Egg is hidden...\nFind it first to claim **{amt} Aura**! 🕵️‍♂️", color=discord.Color.gold()))
         
@@ -4892,7 +5727,7 @@ async def setup_birthday_panel(i: discord.Interaction):
     if not is_staff(i.user): 
         return await i.response.send_message("Staff only.", ephemeral=True)
         
-    channel = bot.get_channel(BIRTHDAY_CHANNEL_ID)
+    channel = GlobalChannelProxy("BIRTHDAY_CHANNEL_ID")
     if not channel: 
         return await i.response.send_message("Invalid Birthday Channel ID.", ephemeral=True)
         
@@ -4954,6 +5789,99 @@ async def list_role(i: discord.Interaction, role: discord.Role):
     
 
 #-------------------tickets-------------------------------
+
+
+@bot.tree.command(name="setup_config", description="Staff: Configure server specific channels and roles")
+@app_commands.describe(
+    chat_channel="Main chat channel",
+    payout_channel="Channel for payouts",
+    announce_channel="Channel for daily announcements",
+    public_log_channel="Public logging channel",
+    help_channel="Support/Help channel",
+    confession_channel="Confession channel",
+    birthday_channel="Birthday announcements channel",
+    admin_role="Admin role for full bot access",
+    master_sheet_url="Link to the Master Pay Sheet"
+)
+async def setup_config(
+    i: discord.Interaction, 
+    chat_channel: discord.TextChannel = None,
+    payout_channel: discord.TextChannel = None,
+    announce_channel: discord.TextChannel = None,
+    public_log_channel: discord.TextChannel = None,
+    help_channel: discord.TextChannel = None,
+    confession_channel: discord.TextChannel = None,
+    birthday_channel: discord.TextChannel = None,
+    admin_role: discord.Role = None,
+    master_sheet_url: str = None
+):
+    if not is_staff(i.user):
+        return await i.response.send_message("❌ You do not have permission to run this command.", ephemeral=True)
+    
+    guild_id = str(i.guild.id)
+    if guild_id not in server_configs:
+        server_configs[guild_id] = {}
+        
+    updated = False
+    if chat_channel: server_configs[guild_id]["CHAT_CHANNEL_ID"] = chat_channel.id; updated = True
+    if payout_channel: server_configs[guild_id]["PAYOUT_CHANNEL_ID"] = payout_channel.id; updated = True
+    if announce_channel: server_configs[guild_id]["DAILY_ANNOUNCE_CHANNEL_ID"] = announce_channel.id; updated = True
+    if public_log_channel: server_configs[guild_id]["PUBLIC_LOG_CHANNEL_ID"] = public_log_channel.id; updated = True
+    if help_channel: server_configs[guild_id]["HELP_CHANNEL_ID"] = help_channel.id; updated = True
+    if confession_channel: server_configs[guild_id]["CONFESSION_CHANNEL_ID"] = confession_channel.id; updated = True
+    if birthday_channel: server_configs[guild_id]["BIRTHDAY_CHANNEL_ID"] = birthday_channel.id; updated = True
+    if admin_role: server_configs[guild_id]["ADMIN_ROLE_ID"] = admin_role.id; updated = True
+    if master_sheet_url: server_configs[guild_id]["MASTER_SHEET_URL"] = master_sheet_url; updated = True
+    
+    if updated:
+        save_data()
+        await i.response.send_message("✅ General configuration has been updated for this server. For ticket verification, use `/setup_verify`.", ephemeral=True)
+    else:
+        await i.response.send_message("ℹ️ No configuration options were provided to update.", ephemeral=True)
+
+@bot.tree.command(name="setup_verify", description="Staff: Configure the roles and categories for ticket verification on this server")
+@app_commands.describe(
+    payment_category="Category for payment tickets",
+    aged_role="Role for 1+ year old Reddit accounts",
+    karma_role="Role for 1000+ Karma Reddit accounts",
+    cqs_highest="Role for Highest CQS",
+    cqs_high="Role for High CQS",
+    cqs_mod="Role for Moderate CQS",
+    cqs_low="Role for Low CQS"
+)
+async def setup_verify(
+    i: discord.Interaction, 
+    payment_category: discord.CategoryChannel = None,
+    aged_role: discord.Role = None,
+    karma_role: discord.Role = None,
+    cqs_highest: discord.Role = None,
+    cqs_high: discord.Role = None,
+    cqs_mod: discord.Role = None,
+    cqs_low: discord.Role = None
+):
+    if not is_staff(i.user):
+        return await i.response.send_message("❌ You do not have permission to run this command.", ephemeral=True)
+    
+    guild_id = str(i.guild.id)
+    if guild_id not in server_configs:
+        server_configs[guild_id] = {}
+        
+    updated = False
+    if payment_category: server_configs[guild_id]["PAYMENT_TICKET_CATEGORY_ID"] = payment_category.id; updated = True
+    if aged_role: server_configs[guild_id]["AGED_ACC_ROLE_ID"] = aged_role.id; updated = True
+    if karma_role: server_configs[guild_id]["HIGH_KARMA_ROLE_ID"] = karma_role.id; updated = True
+    if cqs_highest: server_configs[guild_id]["CQS_HIGHEST_ROLE_ID"] = cqs_highest.id; updated = True
+    if cqs_high: server_configs[guild_id]["CQS_HIGH_ROLE_ID"] = cqs_high.id; updated = True
+    if cqs_mod: server_configs[guild_id]["CQS_MOD_ROLE_ID"] = cqs_mod.id; updated = True
+    if cqs_low: server_configs[guild_id]["CQS_LOW_ROLE_ID"] = cqs_low.id; updated = True
+    
+    if updated:
+        save_data()
+        await i.response.send_message("✅ Verification configuration has been updated for this server.", ephemeral=True)
+    else:
+        await i.response.send_message("ℹ️ No configuration options were provided to update.", ephemeral=True)
+
+
 @bot.tree.command(name="verify", description="Staff: Verify ticket")
 async def verify(i: discord.Interaction, user: discord.Member, role1: Optional[discord.Role]=None, role2: Optional[discord.Role]=None, role3: Optional[discord.Role]=None):
     if not is_staff(i.user) or not is_ticket_channel(i.channel): 
@@ -4965,12 +5893,12 @@ async def verify(i: discord.Interaction, user: discord.Member, role1: Optional[d
         new_name = user.display_name[:100]
         await i.channel.edit(name=new_name)
         
-        for rid in REMOVE_ROLE_IDS:
+        for rid in get_config(i.guild.id, "REMOVE_ROLE_IDS"):
             r = i.guild.get_role(rid)
             if r and r in user.roles: 
                 await user.remove_roles(r)
                 
-        roles_to_add = [i.guild.get_role(rid) for rid in AUTO_ROLE_IDS if i.guild.get_role(rid)]
+        roles_to_add = [i.guild.get_role(rid) for rid in get_config(member.guild.id if "member" in locals() and hasattr(member, "guild") and member.guild else 0, "AUTO_ROLE_IDS") if isinstance(rid, int) and i.guild.get_role(rid)]
         
         if role1: roles_to_add.append(role1)
         if role2: roles_to_add.append(role2)
@@ -4980,7 +5908,7 @@ async def verify(i: discord.Interaction, user: discord.Member, role1: Optional[d
             await user.add_roles(*roles_to_add)
         
         formatted_ticket_name = new_name.lower().replace(" ", "-")
-        desc = (f"**Welcome!** {user.mention}\nTo claim tasks, please send your ticket as soon as tasks are available.\n\n**📍 Where to send your ticket:**\n<#1450947408606269583>\n<#1450948163002302464>\n<#1450947898324947099>\n\n**Important points:**\n- Your ticket name is **#{formatted_ticket_name}**\n- Task channels are opened only when tasks are available\n\n{E_VIBE} **Time to earn!!!**")
+        desc = (f"**Welcome!** {user.mention}\nTo claim tasks, please send your ticket as soon as tasks are available.\n\n**📍 Where to send your ticket:**\n<#1518207367941193972>\n<#1518207420487172156>\n<#1518207461650202755>\n\n**Important points:**\n- Your ticket name is **#{formatted_ticket_name}**\n- Task channels are opened only when tasks are available\n\n{E_VIBE} **Time to earn!!!**")
         
         embed = discord.Embed(title=f"{E_SUCCESS} **VERIFIED** {E_SUCCESS}", description=desc, color=discord.Color.green())
         
@@ -5000,7 +5928,12 @@ async def notfit(i: discord.Interaction, user: discord.Member):
     await i.channel.edit(name=f"not fit-{user.display_name}"[:100])
     
     desc = (f"{user.mention}, sorry, you are not fit for doing tasks yet. Your account needs at least:\n- 100 karma\n- 20 comment karma\n- 1 month old\n- Moderate+ CQS\n\nYou are welcome to stay and apply again later!")
-    await i.response.send_message(embed=discord.Embed(title=f"{E_WARN} Application Update", description=desc, color=discord.Color.red()))
+    msg_content = (
+        f"{user.mention}\n"
+        f"If you were rejected for low karma, please read <#1449052486668255262>.\n"
+        f"If you have any doubts, go to the help channel <#1448787031810642010>."
+    )
+    await i.response.send_message(content=msg_content, embed=discord.Embed(title=f"{E_WARN} Application Update", description=desc, color=discord.Color.red()))
 
 @bot.tree.command(name="help", description="Show all available bot commands")
 async def help_cmd(i: discord.Interaction):
@@ -5068,7 +6001,7 @@ async def force_recap(i: discord.Interaction):
         return await i.response.send_message("Staff only.", ephemeral=True)
     
     await i.response.defer(ephemeral=True)
-    ch = bot.get_channel(DAILY_ANNOUNCE_CHANNEL_ID)
+    ch = GlobalChannelProxy("DAILY_ANNOUNCE_CHANNEL_ID")
     if not ch:
         return await i.followup.send("Announce channel not found.", ephemeral=True)
 
@@ -5107,7 +6040,9 @@ async def force_recap(i: discord.Interaction):
         f"Be funny, engaging, like a sports commentator. 4 sentences max."
     )
     # Giving it 600 tokens so it never gets cut off
-    recap = await quick_ai(prompt, max_tokens=600)
+    recap = await quick_ai(prompt, max_tokens=2000)
+    if recap and len(recap) > 4000:
+        recap = recap[:4000] + "..."
 
     embed = discord.Embed(
         title="📊 Weekly Server Recap",
@@ -5133,7 +6068,7 @@ async def force_puzzle_cmd(i: discord.Interaction):
     if not is_staff(i.user):
         return await i.response.send_message("Staff only.", ephemeral=True)
         
-    channel = bot.get_channel(CHAT_CHANNEL_ID)
+    channel = bot.get_channel(get_config(guild.id, "CHAT_CHANNEL_ID")) if "guild" in locals() and guild else GlobalChannelProxy("CHAT_CHANNEL_ID")
     if not channel:
         return await i.response.send_message("Chat channel not found.", ephemeral=True)
         
@@ -5184,7 +6119,7 @@ async def add_role_to_tickets(i: discord.Interaction, role: discord.Role):
     await i.response.defer(ephemeral=True)
     
     # Combine both your standard ticket categories and the payment category
-    all_ticket_categories = TICKET_CATEGORY_IDS | {PAYMENT_TICKET_CATEGORY_ID}
+    all_ticket_categories = TICKET_CATEGORY_IDS | {get_config(i.guild.id if hasattr(i, "guild") and i.guild else None, "PAYMENT_TICKET_CATEGORY_ID")}
     updated_count = 0
     
     for channel in i.guild.text_channels:
@@ -5221,7 +6156,7 @@ async def verify_sheet(i: discord.Interaction, sheet_url: str):
     is_verifying_locked = True
     await i.response.defer()
     
-    MASTER_SHEET_URL = "https://docs.google.com/spreadsheets/d/16LsJL4-1Rv8gWbmjpS7GkC9HOmD1JAvLBYcWnGRkpHM/edit"
+    MASTER_SHEET_URL = get_config(i.guild.id, "MASTER_SHEET_URL")
     
     try:
         reddit_token = await get_reddit_token()
@@ -5350,6 +6285,24 @@ async def verify_sheet(i: discord.Interaction, sheet_url: str):
                     stats["failed"] += 1 
                     
                 await asyncio.sleep(1.2)
+            else:
+                # No URL found in C or D. Check if amount is listed.
+                # Only check columns E (4) and F (5) to avoid triggering on G/H checkboxes.
+                has_amount = False
+                for c_idx in range(4, min(6, len(row))):
+                    val = str(row[c_idx]).strip().upper()
+                    # Ignore empty, checkboxes, or zero amounts
+                    if val and val not in ["FALSE", "TRUE", "-", "0", "0.00", "$0", "$0.00"]:
+                        if not re.match(r'^[\$€£₹]?\s*0([.,]0+)?$', val):
+                            has_amount = True
+                            break
+                
+                if has_amount:
+                    stats["filtered"] += 1
+                    filtered_rows.append(str(sheet_row))
+                    updates.append({'range': f'G{sheet_row}', 'values': [[True]]}) # TICK FILTERED
+                    user_sheet.format(f'A{sheet_row}:H{sheet_row}', {'backgroundColor': {'red': 1.0, 'green': 0.0, 'blue': 0.0}})
+                    await asyncio.sleep(1.2)
 
         if updates:
             user_sheet.batch_update(updates)
@@ -5479,149 +6432,309 @@ async def cancel_reminder(i: discord.Interaction, reminder_id: str):
             active = "There are no active reminders in this channel."
         await i.response.send_message(f"❌ Reminder ID not found. Active reminders here:\n{active}", ephemeral=True)
         
-# --- SMMWIZ CONFIGURATION ---
-SMMWIZ_API_KEY = os.getenv("SMMWIZ_API_KEY")
-SMMWIZ_URL = "https://smmwiz.com/api/v2"
-ADMIN_ROLE_ID = 1448719741756768308  # Strictly enforced admin role
+# --- UPVOTEMAX CONFIGURATION ---
+UPVOTEMAX_API_KEY = os.getenv("UPVOTEMAX_API_KEY")
+UPVOTEMAX_URL = "https://upvotemax.com/api/public/v1/orders"
+ALLOWED_UPVOTE_ROLES = [1448719741756768308, 1449035039072452800]  # Allowed roles for upvoting
+
+UPVOTE_ORDERS_FILE = "upvote_orders.json"
+
+def load_upvote_orders():
+    import os, json
+    if os.path.exists(UPVOTE_ORDERS_FILE):
+        with open(UPVOTE_ORDERS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_upvote_orders(data):
+    import json
+    with open(UPVOTE_ORDERS_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+upvote_orders_db = load_upvote_orders()
+
+from discord.ext import tasks
+
+@tasks.loop(minutes=5)
+async def check_upvote_orders():
+    if not upvote_orders_db:
+        return
+        
+    order_ids = list(upvote_orders_db.keys())
+    for i in range(0, len(order_ids), 100):
+        batch = order_ids[i:i+100]
+        payload = {"orders": batch}
+        headers = {"x-api-key": UPVOTEMAX_API_KEY, "Content-Type": "application/json"}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post("https://upvotemax.com/api/public/v1/status", json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        orders_res = data.get("orders", {})
+                        
+                        items = []
+                        if isinstance(orders_res, dict):
+                            items = orders_res.items()
+                        elif isinstance(orders_res, list):
+                            items = [(str(o.get("order", o.get("id"))), o) for o in orders_res]
+                            
+                        changed = False
+                        for oid, details in items:
+                            status = str(details.get("status", "")).lower()
+                            if status in ["completed", "failed", "partial", "canceled"]:
+                                order_info = upvote_orders_db.get(oid)
+                                if order_info:
+                                    channel = bot.get_channel(order_info["channel_id"])
+                                    if channel:
+                                        color = discord.Color.green() if status == "completed" else discord.Color.red()
+                                        embed = discord.Embed(
+                                            title=f"✅ Order {status.title()}",
+                                            description=f"Your `{order_info['action']}` order for `{order_info['quantity']}` votes has finished.",
+                                            color=color
+                                        )
+                                        embed.add_field(name="Order ID", value=f"`{oid}`")
+                                        embed.add_field(name="Target Link", value=f"[Open Link]({order_info['target_url']})")
+                                        await channel.send(content=f"<@{order_info['user_id']}>", embed=embed)
+                                    del upvote_orders_db[oid]
+                                    changed = True
+                        if changed:
+                            save_upvote_orders(upvote_orders_db)
+        except Exception as e:
+            logging.error(f"Error checking provider orders: {e}")
 
 @bot.tree.command(
-    name="buy_upvotes", 
-    description="Admin Only: Deploy a real-money Reddit upvote campaign via Smmwiz"
+    name="reddit_vote", 
+    description="Admin Only: Deploy Reddit upvotes/downvotes"
 )
 @app_commands.describe(
-    post_url="Link to the Reddit post", 
-    batch_size="How many upvotes to send in each batch (Minimum is 10)",
-    runs="How many batches to send total",
-    interval_mins="Minutes to wait between each batch deployment"
+    target_url="Link to the Reddit post or comment", 
+    action="Type of action",
+    quantity="How many votes to send (minimum usually 10)",
+    speed="Speed of delivery per hour (Optional, 10-5000)"
 )
-async def buy_upvotes(
+@app_commands.choices(action=[
+    app_commands.Choice(name="Post Upvote", value="post_upvote"),
+    app_commands.Choice(name="Post Downvote", value="post_downvote"),
+    app_commands.Choice(name="Comment Upvote", value="comment_upvote"),
+    app_commands.Choice(name="Comment Downvote", value="comment_downvote"),
+])
+async def reddit_vote(
     i: discord.Interaction, 
-    post_url: str, 
-    batch_size: int, 
-    runs: int, 
-    interval_mins: int
+    target_url: str, 
+    action: app_commands.Choice[str], 
+    quantity: int,
+    speed: int = 50
 ):
     # 1. Strict Admin Role Verification
-    has_role = any(role.id == ADMIN_ROLE_ID for role in i.user.roles)
+    has_role = any(role.id in ALLOWED_UPVOTE_ROLES for role in i.user.roles)
     if not has_role:
         return await i.response.send_message(
             "❌ **Access Denied:** This command is strictly restricted to authorized administrators.", 
             ephemeral=True
         )
 
-    # 2. Configuration & Real Money Cost Tracking
-    SERVICE_ID = 4749  
-    PRICE_PER_1000 = 31.36  # The actual Smmwiz wholesale rate for this service
-    
-    total_upvotes = batch_size * runs
-    # Calculate real dollar amount spent from your Smmwiz panel account
-    real_usd_cost = (total_upvotes / 1000) * PRICE_PER_1000
-
-    if batch_size < 10:
+    if quantity < 10:
         return await i.response.send_message(
-            "❌ **Order Rejected:** Smmwiz requires a minimum `batch_size` of 10 upvotes per batch.", 
+            "❌ **Order Rejected:** Minimum quantity is usually 10.", 
             ephemeral=True
         )
 
-    # Defer to allow external API response time
     await i.response.defer(ephemeral=False)
 
-    # 3. Build the Smmwiz API Payload
     payload = {
-        "key": SMMWIZ_API_KEY,
-        "action": "add",
-        "service": SERVICE_ID,
-        "link": post_url,
-        "quantity": batch_size,   
-        "runs": runs,             
-        "interval": interval_mins 
+        "service": action.value,
+        "link": target_url,
+        "quantity": quantity,
+        "speed": speed
+    }
+    
+    headers = {
+        "x-api-key": UPVOTEMAX_API_KEY,
+        "Content-Type": "application/json"
     }
 
     try:
-        # 4. Dispatch the Real Money Order
         async with aiohttp.ClientSession() as session:
-            async with session.post(SMMWIZ_URL, data=payload) as resp:
-                if resp.status != 200:
-                    return await i.followup.send(f"❌ **API Error Code {resp.status}:** Could not connect to Smmwiz backend.")
-                
-                data = await resp.json()
+            async with session.post(UPVOTEMAX_URL, json=payload, headers=headers) as resp:
+                data = {}
+                try:
+                    data = await resp.json()
+                except:
+                    text = await resp.text()
+                    return await i.followup.send(f"❌ **API Error Code {resp.status}:** Could not connect to provider. Response: `{text[:200]}`")
 
-        # 5. Process Output
-        if "order" in data:
-            order_id = data["order"]
+                if resp.status not in [200, 201]:
+                    error_msg = data.get("message") or data.get("error") or str(data)
+                    return await i.followup.send(f"❌ **API Error Code {resp.status}:** `{error_msg}`")
 
-            # Create an agency-style tracking embed
+        # Process Output
+        if data.get("status") in ["success", "ok", "Created"] or "order" in data or "id" in data or "orderId" in data:
+            order_id = data.get("order") or data.get("id") or data.get("orderId") or "Unknown"
+
             embed = discord.Embed(
                 title="⚡ Campaign Deployed Successfully",
-                description=f"The backend order has been routed directly to your Smmwiz wholesale pool.",
-                color=discord.Color.blue()
+                description=f"Your order has been routed successfully.",
+                color=discord.Color.red()
             )
-            embed.add_field(name="Target Post", value=f"[Open Link]({post_url})", inline=False)
-            embed.add_field(name="Total Target", value=f"📈 **{total_upvotes:,}** Upvotes", inline=True)
-            embed.add_field(name="Pacing Strategy", value=f"⏳ {runs} batches of {batch_size}\nEvery {interval_mins} mins", inline=True)
+            embed.add_field(name="Target Link", value=f"[Open Link]({target_url})", inline=False)
+            embed.add_field(name="Action", value=f"📈 **{action.name}**", inline=True)
+            embed.add_field(name="Quantity", value=f"🎯 **{quantity}**", inline=True)
+            embed.add_field(name="Speed", value=f"⏱️ **{speed}/hr**", inline=True)
             embed.add_field(name="Order ID", value=f"`{order_id}`", inline=False)
-            # Shows exactly how much of your actual cash was spent on this run
-            embed.add_field(name="Real Cost Deducted", value=f"💵 **${real_usd_cost:.4f} USD**", inline=True)
             embed.set_footer(text=f"Executed by Admin: {i.user.display_name}")
             
             await i.followup.send(embed=embed)
             
+            upvote_orders_db[str(order_id)] = {
+                "user_id": i.user.id,
+                "channel_id": i.channel.id,
+                "action": action.name,
+                "quantity": quantity,
+                "target_url": target_url
+            }
+            save_upvote_orders(upvote_orders_db)
+            
         else:
-            error_msg = data.get("error", "Unknown SMM Platform Error")
-            await i.followup.send(f"❌ **Panel API Error:** `{error_msg}`")
+            error_msg = data.get("error") or data.get("message") or "Unknown API Error"
+            await i.followup.send(f"❌ **Panel API Error:** `{error_msg}`\nDetails: `{data}`")
 
     except Exception as e:
         await i.followup.send(f"❌ **Network Exception:** Connection failed. `{e}`")
         
-@bot.tree.command(name="delete_inactive_tickets", description="Delete tickets based on time since last message")
+@bot.tree.command(name="delete_inactive_tickets", description="Staff: Delete inactive tickets across ALL ticket categories at once")
 @app_commands.describe(
-    category="The category to scan",
-    days="Days since last message (Default: 14)",
+    days="Days since last message to consider inactive (Default: 14)",
     hours="Hours since last message (Default: 0)",
     minutes="Minutes since last message (Default: 0)"
 )
 @app_commands.default_permissions(manage_channels=True)
 async def delete_inactive_tickets(
-    i: discord.Interaction, 
-    category: discord.CategoryChannel, 
-    days: int = 14, 
-    hours: int = 0, 
+    i: discord.Interaction,
+    days: int = 14,
+    hours: int = 0,
     minutes: int = 0
 ):
-    await i.response.defer(ephemeral=True)
-    
-    # Calculate cutoff based on user input
-    cutoff_date = discord.utils.utcnow() - timedelta(days=days, hours=hours, minutes=minutes)
-    
-    # Create a descriptive string for the log
+    if not is_staff(i.user):
+        return await i.response.send_message("Staff only.", ephemeral=True)
+
+    await i.response.defer()
+
+    # All ticket category IDs (standard + payment)
+    all_ticket_category_ids = TICKET_CATEGORY_IDS | {get_config(message.guild.id if hasattr(message, "guild") and message.guild else None, "PAYMENT_TICKET_CATEGORY_ID")}
+
+    cutoff_date = discord.utils.utcnow() - datetime.timedelta(days=days, hours=hours, minutes=minutes)
     time_desc = f"{days}d {hours}h {minutes}m"
-        
-    deleted_count = 0
-    kept_count = 0
-    
-    for channel in category.text_channels:
-        try:
-            # Check the latest message
-            messages = [msg async for msg in channel.history(limit=1)]
-            
-            # Logic: If empty, use creation date. If messages exist, use last message date.
-            last_activity = messages[0].created_at if messages else channel.created_at
-            
-            if last_activity <= cutoff_date:
-                await channel.delete(reason=f"Cleanup: Inactive for {time_desc}")
-                deleted_count += 1
-            else:
+
+    total_deleted = 0
+    total_kept = 0
+    total_errored = 0
+    category_results = []
+
+    for cat_id in all_ticket_category_ids:
+        category = i.guild.get_channel(cat_id)
+        if not category or not isinstance(category, discord.CategoryChannel):
+            continue
+
+        deleted_count = 0
+        kept_count = 0
+
+        for channel in category.text_channels:
+            try:
+                messages = [msg async for msg in channel.history(limit=1)]
+                last_activity = messages[0].created_at if messages else channel.created_at
+
+                if last_activity <= cutoff_date:
+                    await channel.delete(reason=f"Auto-cleanup: Inactive for {time_desc} by {i.user.display_name}")
+                    deleted_count += 1
+                    total_deleted += 1
+                else:
+                    kept_count += 1
+                    total_kept += 1
+
+            except Exception as e:
+                logging.error(f"Skipped {channel.name} in {category.name}: {e}")
+                total_errored += 1
                 kept_count += 1
-                
-        except Exception as e:
-            print(f"Skipped {channel.name}: {e}")
-            kept_count += 1
-            
-    embed = discord.Embed(title="🗑️ Ticket Cleanup Complete", color=0xFF0000)
-    embed.add_field(name="Category", value=category.name, inline=True)
-    embed.add_field(name="Threshold", value=time_desc, inline=True)
-    embed.add_field(name="Results", value=f"Deleted: {deleted_count} | Kept: {kept_count}", inline=False)
-    
+
+        if deleted_count > 0 or kept_count > 0:
+            category_results.append(f"**{category.name}** — 🗑️ {deleted_count} deleted, ✅ {kept_count} kept")
+
+    embed = discord.Embed(
+        title="🗑️ Inactive Ticket Cleanup Complete",
+        description=f"Threshold: **{time_desc}** of inactivity",
+        color=0xFF4444,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(
+        name="📊 Overall Results",
+        value=f"🗑️ **Deleted:** {total_deleted}\n✅ **Kept:** {total_kept}\n⚠️ **Errors:** {total_errored}",
+        inline=False
+    )
+    if category_results:
+        # Split into chunks to avoid embed field limit
+        chunk_size = 10
+        for idx in range(0, len(category_results), chunk_size):
+            chunk = category_results[idx:idx + chunk_size]
+            embed.add_field(
+                name=f"📁 Categories ({idx + 1}–{idx + len(chunk)})",
+                value="\n".join(chunk),
+                inline=False
+            )
+    embed.set_footer(text=f"Run by {i.user.display_name}")
+
     await i.followup.send(embed=embed)
+
+@bot.tree.command(name="add_puzzle", description="Staff: Add a custom puzzle")
+@app_commands.choices(ptype=[
+    app_commands.Choice(name="Riddle", value="riddle"),
+    app_commands.Choice(name="Word Scramble", value="scramble"),
+    app_commands.Choice(name="Math", value="math"),
+    app_commands.Choice(name="Emoji", value="emoji"),
+    app_commands.Choice(name="Fill in the Blank", value="fillblank")
+])
+async def add_puzzle(i: discord.Interaction, ptype: app_commands.Choice[str], question: str, answer: str):
+    if not is_staff(i.user):
+        return await i.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+    
+    new_puzzle = {"type": ptype.value, "q": question, "a": answer}
+    
+    custom_puzzles = data.get("custom_puzzles", [])
+    custom_puzzles.append(new_puzzle)
+    data["custom_puzzles"] = custom_puzzles
+    save_data()
+    
+    PUZZLES.append(new_puzzle)
+    
+    global active_puzzle
+    active_puzzle["question"] = question
+    active_puzzle["answer"] = answer
+    active_puzzle["type"] = ptype.value
+    active_puzzle["solved"] = False
+    save_data()
+
+    channel = bot.get_channel(get_config(guild.id, "CHAT_CHANNEL_ID")) if "guild" in locals() and guild else GlobalChannelProxy("CHAT_CHANNEL_ID")
+    if channel:
+        type_config = {
+            "riddle":    ("🧩", "Riddle",            discord.Color.purple(),  "Think carefully and type your answer!"),
+            "scramble":  ("🔀", "Word Scramble",      discord.Color.orange(),  "Unscramble the letters to find the word!"),
+            "math":      ("🔢", "Math Challenge",     discord.Color.blue(),    "Type just the number as your answer!"),
+            "trivia":    ("🎯", "Trivia Question",    discord.Color.gold(),    "Type your answer in chat!"),
+            "emoji":     ("🎭", "Emoji Puzzle",       discord.Color.fuchsia(), "Decode the emojis and type what it represents!"),
+            "fillblank": ("✏️", "Fill in the Blank",  discord.Color.green(),   "Type the missing word to complete the phrase!"),
+        }
+        emoji_icon, type_name, color, hint = type_config.get(ptype.value, ("🧩", "Puzzle", discord.Color.purple(), "Type your answer!"))
+        
+        embed = discord.Embed(
+            title=f"{emoji_icon} {type_name} — First to answer wins 50 Aura!",
+            description=f"**{question}**\n\n*{hint}*",
+            color=color
+        )
+        embed.set_footer(text=f"⚙️ Added by Staff  •  Type: {type_name}")
+        
+        await channel.send(embed=embed)
+        await i.response.send_message(f"✅ Successfully added and forced puzzle into chat: **{question}** (Answer: {answer})", ephemeral=True)
+    else:
+        await i.response.send_message(f"✅ Successfully added puzzle: **{question}** (Answer: {answer}), but couldn't find chat channel to drop it.", ephemeral=True)
 
 bot.run(TOKEN)

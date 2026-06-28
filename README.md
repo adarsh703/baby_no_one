@@ -13,6 +13,7 @@ Designed to feel like a real, slightly witty server member rather than a robotic
 * **Persistent Memory:** Uses AI to extract and remember key facts about users over time.
 * **Background Personalities:** Automatically drops science facts, daily market hot takes, and server mood checks based on chat activity.
 * **Smart Parsing:** AI determines if users are asking for money, requesting tasks, or just chatting, and reacts accordingly.
+* **Premium AI Access 💎:** Certain AI functionalities are locked behind a Premium Server tier. Server owners can upgrade to unlock full AI chat capabilities!
 
 ### 📈 Dynamic Stock Market
 * **Live Mod Coins:** A fully simulated stock market with coins like `$No_ONe`, `$MUFFIN`, and `$DJ_hunks`.

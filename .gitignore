@@ -2,6 +2,7 @@ env
 .env
 *.db
 *.log
-gcp-key.json
-data.json
+*.json
+*.bak
 __pycache__/
+venv/
